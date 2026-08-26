@@ -153,6 +153,6 @@ end
 Format setpoints into the standard ASCII serial command recognized by the MCU firmware:
 `PC,<current_A>,<co2_pct>,<pump_pct>\\r`
 """
-function format_mcu_actuator_command(current_A::Float64, co2_pct::Float64, pump_pct::Float64)::String
-    return @sprintf("PC,%.1f,%.1f,%.1f\r", current_A, co2_pct, pump_pct)
+function format_mcu_actuator_command(current_A::Real, co2_pct::Real, pump_pct::Real)::String
+    return @sprintf("PC,%.1f,%.1f,%.1f\r", Float64(current_A), Float64(co2_pct), Float64(pump_pct))
 end
