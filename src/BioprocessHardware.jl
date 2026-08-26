@@ -29,12 +29,14 @@ export detect_windows_com_ports, open_mcu_serial_port
 
 # BioFlo Modbus
 export float32_to_bytes, bytes_to_float32, read_bioflo_holding_registers, write_bioflo_holding_register
+export BioFloConn, bioflo_close!, bioflo_read_pvs, bioflo_set_co2_sp!
+export start_bioflo_monitor_task!, start_bioflo_pwm_task!
 
 # Yocto Sensor
-export read_yocto_co2, start_yocto_bridge_if_needed
+export run_yocto_monitor_task!
 
 # Numato Relay
-export init_numato_port, set_relay_state, read_adc_voltage
+export read_numato_adc, set_numato_relay
 
 # Submodules
 export CO2Doser
