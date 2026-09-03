@@ -57,7 +57,7 @@ function run_yocto_monitor_task!(
                     parsed = JSON3.read(content)
                     is_valid = get(parsed, :valid, false) || get(parsed, "valid", false)
                     if is_valid
-                        dco2_val = Float64(get(parsed, :dco2_mg_L, get(parsed, :dco2_val, get(parsed, :dco2_percent, get(parsed, "dco2_mg_L", get(parsed, "dco2_val", get(parsed, "dco2_percent", NaN)))))))
+                        dco2_val = Float64(get(parsed, :dco2_percent, get(parsed, "dco2_percent", get(parsed, :dco2_val, get(parsed, "dco2_val", NaN)))))
                         raw_mA_val = Float64(get(parsed, :raw_mA, get(parsed, "raw_mA", NaN)))
                         if !isnan(dco2_val)
                             latest_yocto_data_ref[] = (dco2_measured=dco2_val, raw_mA=raw_mA_val, valid=true, last_update=now())
