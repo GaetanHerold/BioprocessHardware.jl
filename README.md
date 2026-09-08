@@ -29,6 +29,8 @@ Pkg.develop(path="packages/BioprocessHardware.jl")
 
 ## Quick Example
 
+### 1. MCU Telemetry Parsing & Command Formatting
+
 ```julia
 using BioprocessHardware
 
@@ -42,4 +44,20 @@ println("Extraction pH: ", reading.pH_extr)
 # Format command to MCU (Current = 3.5 A, CO2 = 50 %, Pump = 60 %)
 cmd = format_mcu_actuator_command(3.5, 50.0, 60.0)
 println("Formatted Command: ", repr(cmd))
+```
+
+### 2. High-Throughput SQLite WAL Logging
+
+```julia
+using BioprocessHardware
+using SQLite
+
+# Initialize experiment telemetry database
+db_path = "experiments/Lab_Experiments.sqlite"
+exp_id = "test_hardware_run"
+(db, log_stmt) = init_telemetry_db(db_path, exp_id, false)
+
+# Store active control parameters
+insert_params_to_db!(db, exp_id, Dict("target_pH" => 6.2, "Kp" => 0.1), "initial")
+println("Telemetry database initialized with WAL journaling.")
 ```
