@@ -31,7 +31,7 @@ jobs:
       - name: Cache Julia Packages and Precompiled Binaries
         uses: julia-actions/cache@v2
         with:
-          cache-compiled-code: 'true'
+          cache-compiled: 'true'
           cache-registries: 'true'
 
       - name: Instantiate Documentation Environment
