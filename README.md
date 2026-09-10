@@ -61,3 +61,14 @@ exp_id = "test_hardware_run"
 insert_params_to_db!(db, exp_id, Dict("target_pH" => 6.2, "Kp" => 0.1), "initial")
 println("Telemetry database initialized with WAL journaling.")
 ```
+
+---
+
+## Project Context & Affiliations
+
+Developed by **Gaétan Herold** in the framework of the European Union Horizon project **[LUCRA](https://lucra-project.eu)** (*Converting bio-waste into bio-based products for a sustainable chemical industry*).
+
+### Academic Affiliations:
+- **[Traslab](https://www.traslab.ugent.be/)** & **[BioMath](https://biomath.ugent.be/)** — Department of Data Analysis and Mathematical Modelling, Ghent University (UGent), Ghent, Belgium
+- **[modelEAU](https://modeleau.fsg.ulaval.ca/)** — Département de génie civil et de génie des eaux, Université Laval (ULaval), Québec, Canada
+
