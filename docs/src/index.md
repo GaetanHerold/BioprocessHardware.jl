@@ -7,14 +7,14 @@
 ## 1. Overview
 
 **BioprocessHardware.jl** isolates physical communication protocols from higher-level control algorithms:
-- **ESP32-S3 Serial Framing**: Robust `PC,<current>,<co2>,<pump>\r` bidirectional packet protocol with timeout detection and watchdog recovery.
-- **BioFlo 120/320 Modbus TCP Driver**: High-speed polling of process values (pH, agitation, temperature, sparge rates) and float32 word-swapping.
-- **Yoctopuce 4-20mA & Numato Relays**: Industrial sensor current loops and USB dosing actuators.
-- **SQLite WAL Telemetry Logger**: High-throughput time-series recording with zero controller blocking.
+- ESP32-S3 serial framing: bidirectional `PC,<current>,<co2>,<pump>\r` packet protocol with timeout detection and watchdog recovery.
+- BioFlo 120/320 Modbus TCP driver: polling of process values (pH, agitation, temperature, sparge rates) and Float32 word-swapping.
+- Yoctopuce 4-20mA and Numato relays: industrial sensor current loops and USB dosing actuators.
+- SQLite WAL telemetry logger: high-throughput time-series recording without controller blocking.
 
 ---
 
-## 2. Quickstart
+## 2. Quick start
 
 ```julia
 using BioprocessHardware

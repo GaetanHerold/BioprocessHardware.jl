@@ -1,8 +1,8 @@
-# Hardware Communication Protocols
+# Hardware communication protocols
 
 ---
 
-## 1. ESP32-S3 Serial Framing
+## 1. ESP32-S3 serial framing
 
 Commands to the pilot actuation MCU are framed with strict ASCII structure and terminated with `\r`:
 
@@ -19,7 +19,7 @@ PC,<current_A>,<co2_pwm>,<pump_pct>\r
 
 ---
 
-## 2. BioFlo Modbus TCP Register Mapping
+## 2. BioFlo Modbus TCP register mapping
 
 The Eppendorf BioFlo 120/320 bioreactor communicates via Modbus TCP (port 502). Process values are encoded as 32-bit big-endian IEEE-754 floats requiring two consecutive 16-bit registers:
 
@@ -32,7 +32,7 @@ The Eppendorf BioFlo 120/320 bioreactor communicates via Modbus TCP (port 502). 
 
 ---
 
-## 3. SQLite WAL High-Throughput Telemetry
+## 3. SQLite WAL high-throughput telemetry
 
 ```@raw html
 <div class="figure-box">
@@ -43,7 +43,7 @@ The Eppendorf BioFlo 120/320 bioreactor communicates via Modbus TCP (port 502). 
 
 ---
 
-## 4. Yoctopuce 4-20mA Sensor Bridge
+## 4. Yoctopuce 4-20mA sensor bridge
 
 ```@raw html
 <div class="figure-box">
