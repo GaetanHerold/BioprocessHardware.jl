@@ -12,12 +12,14 @@ makedocs(
     remotes = nothing,
     format = Documenter.HTML(
         prettyurls = get(ENV, "CI", nothing) == "true",
-        canonical = "https://gaetanherold.github.io/LUCRA/hardware/",
+        canonical = "https://gaetanherold.github.io/BioprocessHardware.jl/",
+        edit_link = "main",
         assets = String["assets/custom.css"],
         mathengine = Documenter.MathJax3()
     ),
     pages = [
         "Home" => "index.md",
+        "Benchtop Quickstart" => "quickstart.md",
         "Hardware Protocols" => "hardware/protocols.md",
         "API Reference" => "api.md",
     ],

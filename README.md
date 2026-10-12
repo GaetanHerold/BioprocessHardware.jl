@@ -66,7 +66,7 @@ println("Telemetry database initialized with WAL journaling.")
 ### 3. Standalone benchtop logging and quickstart
 For standalone lab instrument logging on any laptop:
 - Run standalone examples in `examples/` (e.g. `julia --project=. examples/log_power_supply.jl`).
-- Consult the [Laboratory Hardware Quickstart Guide](file:///Users/gaetanherold/Library/CloudStorage/OneDrive-UGent/PhD/LUCRA/Controllers/Currently%20Used%20System/docs/HARDWARE_QUICKSTART.md) for 2-minute setup, Linux `dialout` instructions, and zero-bloat standalone usage.
+- Consult the [Laboratory Hardware Quickstart Guide](docs/HARDWARE_QUICKSTART.md) for 2-minute setup, Linux `dialout` instructions, and zero-bloat standalone usage.
 
 
 ---
@@ -159,4 +159,10 @@ Developed by **Gaétan Herold** in the framework of the European Union Horizon p
 ### Academic affiliations:
 - **[Traslab](https://www.traslab.ugent.be/)** & **[BioMath](https://biomath.ugent.be/)**, Department of Data Analysis and Mathematical Modelling, Ghent University (UGent), Ghent, Belgium
 - **[modelEAU](https://modeleau.fsg.ulaval.ca/)**, Département de génie civil et de génie des eaux, Université Laval (ULaval), Québec, Canada
+
+---
+
+## License
+
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**. See the [LICENSE](LICENSE) file for the full license text.
 
