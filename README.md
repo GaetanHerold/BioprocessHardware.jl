@@ -63,6 +63,12 @@ insert_params_to_db!(db, exp_id, Dict("target_pH" => 6.2, "Kp" => 0.1), "initial
 println("Telemetry database initialized with WAL journaling.")
 ```
 
+### 3. Standalone benchtop logging and quickstart
+For standalone lab instrument logging on any laptop:
+- Run standalone examples in `examples/` (e.g. `julia --project=. examples/log_power_supply.jl`).
+- Consult the [Laboratory Hardware Quickstart Guide](file:///Users/gaetanherold/Library/CloudStorage/OneDrive-UGent/PhD/LUCRA/Controllers/Currently%20Used%20System/docs/HARDWARE_QUICKSTART.md) for 2-minute setup, Linux `dialout` instructions, and zero-bloat standalone usage.
+
+
 ---
 
 ## Operational boundaries and hardware deployment status (DOC3_HW)
