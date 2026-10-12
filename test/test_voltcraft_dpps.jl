@@ -1,0 +1,100 @@
+using Test
+using Dates
+using BioprocessHardware
+
+@testset "Voltcraft DPPS-16-30 Hardware Driver Tests" begin
+    @testset "1. Frame Parsing & Decoders" begin
+        # CV mode reading: 12.00V, 5.00A
+        raw_cv = "120005000\rOK\r"
+        r1 = parse_dpps_telemetry(raw_cv)
+        @test r1.voltage_V == 12.0
+        @test r1.current_A == 5.0
+        @test r1.power_W ≈ 60.0
+        @test r1.mode == "CV"
+        @test r1.timestamp <= now()
+
+        # CC mode reading: 5.50V, 15.00A
+        raw_cc = "055015001\rOK\r"
+        r2 = parse_dpps_telemetry(raw_cc)
+        @test r2.voltage_V == 5.5
+        @test r2.current_A == 15.0
+        @test r2.power_W ≈ 82.5
+        @test r2.mode == "CC"
+
+        # Zero output reading
+        raw_zero = "000000000\rOK\r"
+        r0 = parse_dpps_telemetry(raw_zero)
+        @test r0.voltage_V == 0.0
+        @test r0.current_A == 0.0
+        @test r0.power_W == 0.0
+        @test r0.mode == "CV"
+
+        # Edge case: High current (30.00A at 16.00V)
+        raw_max = "160030000"
+        rmax = parse_dpps_telemetry(raw_max)
+        @test rmax.voltage_V == 16.0
+        @test rmax.current_A == 30.0
+        @test rmax.power_W ≈ 480.0
+
+        # Corrupted / short payload raises error
+        @test_throws ErrorException parse_dpps_telemetry("1200")
+        @test_throws ErrorException parse_dpps_telemetry("")
+    end
+
+    @testset "2. Mock Device Operations & Control" begin
+        dev = open_dpps("COM4"; mock=true, v_max=16.0, i_max=30.0)
+        @test dev.is_mock == true
+        @test dev.v_max == 16.0
+        @test dev.i_max == 30.0
+        @test dev.mock_output_on == false
+
+        # Test GMAX query
+        gmax_resp = query_dpps(dev, "GMAX")
+        @test gmax_resp == "160300"
+
+        # Test Voltage Setpoint with clamping
+        @test set_dpps_voltage!(dev, 12.5) == true
+        @test dev.mock_voltage == 12.5
+
+        # Over-voltage clamping (exceeding 16.0V)
+        @test set_dpps_voltage!(dev, 25.0) == true
+        @test dev.mock_voltage == 16.0
+
+        # Negative voltage clamping
+        @test set_dpps_voltage!(dev, -5.0) == true
+        @test dev.mock_voltage == 0.0
+
+        # Test Current Setpoint with clamping
+        @test set_dpps_current!(dev, 18.2) == true
+        @test dev.mock_current == 18.2
+
+        # Over-current clamping (exceeding 30.0A)
+        @test set_dpps_current!(dev, 45.0) == true
+        @test dev.mock_current == 30.0
+
+        # Test Output Enable / Disable
+        @test set_dpps_output!(dev, true) == true
+        @test dev.mock_output_on == true
+        @test set_dpps_output!(dev, false) == true
+        @test dev.mock_output_on == false
+
+        # Test Telemetry Reading from Mock
+        dev.mock_voltage = 10.0
+        dev.mock_current = 2.5
+        dev.mock_mode = "CV"
+        reading = read_dpps_telemetry(dev)
+        @test reading.voltage_V == 10.0
+        @test reading.current_A == 2.5
+        @test reading.power_W ≈ 25.0
+        @test reading.mode == "CV"
+
+        # Close Mock
+        close_dpps!(dev)
+        @test dev.sp === nothing
+    end
+
+    @testset "3. Port Enumeration" begin
+        ports = detect_dpps_ports()
+        @test isa(ports, Vector{String})
+    end
+end

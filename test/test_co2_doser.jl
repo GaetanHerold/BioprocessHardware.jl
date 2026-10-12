@@ -25,4 +25,96 @@ using BioprocessHardware
     on_s, off_s = CO2Doser.compute_pwm_times(50.0, 10.0, 1.0, 1.0)
     @test isapprox(on_s, 5.0; atol=1e-5)
     @test isapprox(off_s, 5.0; atol=1e-5)
+
+    # ========================================================================
+    # F26: CalibratedADC4_20mA & Burden Resistor Saturation Guard Tests
+    # ========================================================================
+    # CD4: Default parameters
+    adc_default = CalibratedADC4_20mA()
+    @test adc_default.R_burden == 263.0
+    @test adc_default.V_ref == 5.0
+    @test adc_default.max_counts == 1024.0
+
+    # CD5: Sub-saturation linear mapping
+    # 0 counts clamps to 4.0 mA
+    @test counts_to_mA(adc_default, 0.0) == 4.0
+    # ~215.35 counts corresponds to 4.0 mA
+    @test isapprox(counts_to_mA(adc_default, 215.35), 4.0; atol=0.01)
+    # 600 counts corresponds to V_in = (600/1023)*5 = 2.9325V -> 11.15 mA
+    expected_mA_600 = ((600.0 / 1023.0) * 5.0 / 263.0) * 1000.0
+    @test isapprox(counts_to_mA(adc_default, 600.0), expected_mA_600; atol=1e-4)
+
+    # CD6: Saturation ceiling and warning assertion at >= 1023 counts
+    # Saturation current: 5.000 V / 263.0 Ω * 1000 = 19.0114 mA
+    expected_sat_mA = (5.0 / 263.0) * 1000.0
+    @test isapprox(expected_sat_mA, 19.0114; atol=0.01)
+    @test_logs (:warn, r"ADC input saturated! Current exceeds 19.01 mA.") begin
+        i_sat = counts_to_mA(adc_default, 1023.0)
+        @test isapprox(i_sat, expected_sat_mA; atol=1e-4)
+    end
+    @test_logs (:warn, r"ADC input saturated! Current exceeds 19.01 mA.") begin
+        i_over = counts_to_mA(adc_default, 1024.0)
+        @test i_over <= 20.0
+    end
+
+    # CD7: Current to CO2 percentage conversion
+    @test mA_to_co2(4.0) == 0.0
+    @test mA_to_co2(20.0) == 100.0
+    @test isapprox(mA_to_co2(12.0), 50.0; atol=1e-5)
+    # CO2 at saturation (1023 counts)
+    co2_sat = @test_logs (:warn, r"ADC input saturated! Current exceeds 19.01 mA.") counts_to_co2(adc_default, 1023.0)
+    @test isapprox(co2_sat, (expected_sat_mA - 4.0) / 16.0 * 100.0; atol=1e-3)
+    @test isapprox(co2_sat, 93.82; atol=0.05)
+
+    # ========================================================================
+    # F27: Relay PWM Dwell Time Enforcement Tests
+    # ========================================================================
+    # CD8: Suppression of narrow pulses below minimum dwell (1.0 s)
+    # duty = 0.5% on 10.0s window -> raw_on = 0.05s < 1.0s -> suppressed to 0.0s
+    on_sup, off_sup = CO2Doser.compute_pwm_times(0.5, 10.0, 1.0, 1.0)
+    @test on_sup == 0.0
+    @test off_sup == 10.0
+
+    # duty = 5.0% on 10.0s window -> raw_on = 0.5s < 1.0s -> suppressed to 0.0s
+    on_sup5, off_sup5 = CO2Doser.compute_pwm_times(5.0, 10.0, 1.0, 1.0)
+    @test on_sup5 == 0.0
+    @test off_sup5 == 10.0
+
+    # CD9: Clamping to full-on when off-time violates minimum dwell (1.0 s)
+    # duty = 95.0% on 10.0s window -> raw_on = 9.5s -> off = 0.5s < 1.0s -> clamped to 10.0s
+    on_clamp, off_clamp = CO2Doser.compute_pwm_times(95.0, 10.0, 1.0, 1.0)
+    @test on_clamp == 10.0
+    @test off_clamp == 0.0
+
+    # CD10: Minimum dwell constraints cannot be bypassed by zero or small arguments
+    on_bypass, off_bypass = CO2Doser.compute_pwm_times(0.5, 10.0, 0.0, 0.0)
+    @test on_bypass == 0.0
+    @test off_bypass == 10.0
+    on_bypass95, off_bypass95 = CO2Doser.compute_pwm_times(95.0, 10.0, 0.0, 0.0)
+    @test on_bypass95 == 10.0
+    @test off_bypass95 == 0.0
+
+    # CD11: execute_guarded_relay_pwm and run_pwm_cycle command issuance
+    mock_sleep(t) = nothing # No-op sleep for fast unit test execution
+
+    # Suppressed pulse (< 1.0 s dwell) sends only relay off
+    io_sup = IOBuffer()
+    on_t1, off_t1 = execute_guarded_relay_pwm(io_sup, 5.0, 10.0, 1.0; sleep_fn=mock_sleep)
+    @test on_t1 == 0.0
+    @test off_t1 == 10.0
+    @test String(take!(io_sup)) == "relay off 0\r\n"
+
+    # Clamped to full-on (< 1.0 s off-dwell) sends only relay on
+    io_clamp = IOBuffer()
+    on_t2, off_t2 = execute_guarded_relay_pwm(io_clamp, 95.0, 10.0, 1.0; sleep_fn=mock_sleep)
+    @test on_t2 == 10.0
+    @test off_t2 == 0.0
+    @test String(take!(io_clamp)) == "relay on 0\r\n"
+
+    # Valid 50% duty cycle on 10.0 s window sends on then off
+    io_valid = IOBuffer()
+    on_t3, off_t3 = run_pwm_cycle(io_valid, 50.0, 10.0; sleep_fn=mock_sleep)
+    @test on_t3 == 5.0
+    @test off_t3 == 5.0
+    @test String(take!(io_valid)) == "relay on 0\r\nrelay off 0\r\n"
 end

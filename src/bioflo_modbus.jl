@@ -65,18 +65,40 @@ function float32_to_bytes(f::Float32)
     return take!(buf)
 end
 
-function read_with_timeout(socket::TCPSocket, n_bytes::Int, timeout_s::Float64=5.0)
+"""
+    read_with_timeout(socket::IO, n_bytes::Int, timeout_s::Float64=5.0)::Vector{UInt8}
+
+Reads exactly `n_bytes` from `socket` within `timeout_s` seconds, robustly handling TCP packet
+fragmentation by accumulating successive chunks. If the connection closes (EOF) before `n_bytes`
+are received, returns only the bytes actually read (truncated buffer) so downstream checks
+`length(hdr) < 9` or `length(data) < byte_count` detect the truncation instead of receiving
+uninitialized `undef` heap bytes (Finding F28).
+"""
+function read_with_timeout(socket::IO, n_bytes::Int, timeout_s::Float64=5.0)::Vector{UInt8}
     buf = Vector{UInt8}(undef, n_bytes)
-    task = @async readbytes!(socket, buf, n_bytes)
     t_start = time()
-    while !istaskdone(task)
-        if (time() - t_start) > timeout_s
-            close(socket)
-            error("Socket read timeout ($timeout_s seconds)")
+    bytes_read = 0
+    while bytes_read < n_bytes
+        remaining = n_bytes - bytes_read
+        task = @async readbytes!(socket, view(buf, (bytes_read + 1):n_bytes), remaining)
+        while !istaskdone(task)
+            if (time() - t_start) > timeout_s
+                try
+                    close(socket)
+                catch
+                end
+                error("Socket read timeout ($timeout_s seconds) after receiving $bytes_read/$n_bytes bytes")
+            end
+            sleep(0.005)
         end
-        sleep(0.005)
+        istaskfailed(task) && throw(TaskFailedException(task))
+        n = fetch(task)
+        if n == 0
+            # Remote connection closed / EOF before all requested bytes arrived; truncate undef bytes
+            return buf[1:bytes_read]
+        end
+        bytes_read += n
     end
-    istaskfailed(task) && throw(TaskFailedException(task))
     return buf
 end
 
@@ -218,6 +240,48 @@ function run_bioflo_monitor_task!(
     end
 end
 
+# ============================================================================
+# PUMP ACTUATOR SCALING & CALIBRATION (Finding F29)
+# ============================================================================
+#
+# On the Eppendorf BioFlo 120 bioreactor controller, holding registers 76 and 80
+# configure the speed setpoint for peristaltic Pumps 1 and 3 (Watson-Marlow 114DV heads).
+#
+# Physical & Dimensional Traceability:
+# - Register command units: Rotational speed in revolutions per minute [rpm].
+# - Tubing: Standard Masterflex #16 platinum-cured silicone (inner diameter 3.1 mm, wall 1.6 mm).
+# - Calibration factor: Under nominal suction/discharge conditions (atmospheric backpressure,
+#   viscosity ≈ 1.0 mPa·s), the 114DV pump head dispenses approximately 0.80 - 1.00 mL per revolution.
+#   With calibrated #16 tubing, k_pump = 1.00 mL/(min·rpm) [or 0.01667 mL/(s·rpm)].
+# - Command Float32(18.8):
+#   Writing 18.8 rpm delivers a nominal volumetric dosing rate of:
+#     Q_pump = 18.8 rpm * 1.00 mL/(min·rpm) = 18.8 mL/min = 0.3133 mL/s
+# - System integration:
+#   In BioprocessControl.jl (types.jl:411) and src/types.jl:461, the dosing rate is represented as:
+#     co2_pump_dosing_rate = 18.8 / 60.0  # [mL/s] (or [mL/(L·s)] for a 1.0 L working volume)
+#   This confirms exact dimensional equivalence between the Modbus register command and the simulation models.
+
+const BIOFLO_PUMP_DEFAULT_RPM = Float32(18.8)
+const BIOFLO_PUMP_CALIBRATION_ML_PER_REV = 1.0 # mL/min per rpm for standard #16 tubing
+
+"""
+    pump_rpm_to_flow_ml_min(rpm::Real; k_pump::Real=BIOFLO_PUMP_CALIBRATION_ML_PER_REV)::Float64
+
+Convert BioFlo pump rotational speed [rpm] to volumetric flow rate [mL/min].
+"""
+function pump_rpm_to_flow_ml_min(rpm::Real; k_pump::Real=BIOFLO_PUMP_CALIBRATION_ML_PER_REV)::Float64
+    return Float64(rpm) * Float64(k_pump)
+end
+
+"""
+    pump_flow_ml_min_to_rpm(flow_ml_min::Real; k_pump::Real=BIOFLO_PUMP_CALIBRATION_ML_PER_REV)::Float32
+
+Convert desired volumetric flow rate [mL/min] to BioFlo pump rotational speed setpoint [rpm].
+"""
+function pump_flow_ml_min_to_rpm(flow_ml_min::Real; k_pump::Real=BIOFLO_PUMP_CALIBRATION_ML_PER_REV)::Float32
+    return Float32(flow_ml_min / k_pump)
+end
+
 """
     run_bioflo_pwm_task!(duty_ref, keep_running, params, conn; window_ref, min_on_ref, min_off_ref)
 
@@ -232,8 +296,11 @@ function run_bioflo_pwm_task!(
     min_on_ref::Ref{Float64}=Ref(20.0),
     min_off_ref::Ref{Float64}=Ref(20.0)
 )
+    # Calibrated pump speed setpoint (defaults to 18.8 rpm = 18.8 mL/min)
+    pump_rpm = Float32(get(params, "bioflo_pump_rpm", BIOFLO_PUMP_DEFAULT_RPM))
+
     function set_bioflo_pumps(state::Bool)
-        val = state ? Float32(18.8) : Float32(0.0)
+        val = state ? pump_rpm : Float32(0.0)
         try
             write_float_register(conn, UInt16(76), val)
             sleep(0.1)

@@ -35,4 +35,59 @@ using BioprocessHardware
     rec_inf = bytes_to_float32(bytes_inf)
     @test isinf(rec_inf)
     @test rec_inf > 0.0f0
+
+    # ========================================================================
+    # F28: Modbus TCP Packet Fragmentation & Buffer Truncation Tests
+    # ========================================================================
+    # MB7: Complete read from IOBuffer
+    io_full = IOBuffer(UInt8[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09])
+    res_full = read_with_timeout(io_full, 9, 1.0)
+    @test length(res_full) == 9
+    @test res_full == UInt8[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]
+
+    # MB8: Fragmented TCP stream accumulation
+    # Simulates TCP packet fragmentation: 9-byte frame arrives in 3 chunks of 3 bytes
+    stream_frag = Base.BufferStream()
+    @async begin
+        sleep(0.01)
+        write(stream_frag, UInt8[0xAA, 0xBB, 0xCC])
+        sleep(0.01)
+        write(stream_frag, UInt8[0xDD, 0xEE, 0xFF])
+        sleep(0.01)
+        write(stream_frag, UInt8[0x11, 0x22, 0x33])
+    end
+    res_frag = read_with_timeout(stream_frag, 9, 2.0)
+    @test length(res_frag) == 9
+    @test res_frag == UInt8[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33]
+
+    # MB9: Premature EOF truncation (no undef bytes in buffer)
+    # Stream provides only 4 bytes then closes; buffer should truncate to 4 bytes
+    io_short = IOBuffer(UInt8[0xCA, 0xFE, 0xBA, 0xBE])
+    res_short = read_with_timeout(io_short, 9, 1.0)
+    @test length(res_short) == 4
+    @test res_short == UInt8[0xCA, 0xFE, 0xBA, 0xBE]
+
+    # MB10: Read timeout on stalled stream
+    stream_stalled = Base.BufferStream()
+    @test_throws ErrorException read_with_timeout(stream_stalled, 5, 0.05)
+
+    # ========================================================================
+    # F29: BioFlo Pump Actuator Scaling & Calibration Tests
+    # ========================================================================
+    # MB11: Default pump command constant & calibration factor
+    @test BIOFLO_PUMP_DEFAULT_RPM == 18.8f0
+    @test BIOFLO_PUMP_CALIBRATION_ML_PER_REV == 1.0
+
+    # MB12: Pump rpm to volumetric flow conversion (18.8 rpm -> 18.8 mL/min)
+    flow_nominal = pump_rpm_to_flow_ml_min(BIOFLO_PUMP_DEFAULT_RPM)
+    @test isapprox(flow_nominal, 18.8; atol=1e-5)
+
+    # MB13: Volumetric flow to pump rpm conversion (18.8 mL/min -> 18.8 rpm)
+    rpm_nominal = pump_flow_ml_min_to_rpm(18.8)
+    @test isapprox(rpm_nominal, 18.8f0; atol=1e-5)
+
+    # MB14: Arbitrary flow rate scaling
+    @test isapprox(pump_rpm_to_flow_ml_min(30.0), 30.0; atol=1e-5)
+    @test isapprox(pump_flow_ml_min_to_rpm(30.0), 30.0f0; atol=1e-5)
+    @test isapprox(pump_rpm_to_flow_ml_min(20.0; k_pump=0.8), 16.0; atol=1e-5)
 end

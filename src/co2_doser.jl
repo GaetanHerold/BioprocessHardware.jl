@@ -22,8 +22,9 @@ using LibSerialPort
 using Dates
 
 export CO2SensorCalibration, ControllerConfig, DoserState
+export CalibratedADC4_20mA, counts_to_mA, mA_to_co2, counts_to_co2
 export read_adc, read_co2_percent, set_relay, adc_to_co2
-export compute_duty_cycle, compute_pwm_times, run_pwm_cycle, run_pwm_task!
+export compute_duty_cycle, compute_pwm_times, run_pwm_cycle, execute_guarded_relay_pwm, run_pwm_task!
 export run_standalone, interactive_calibration
 
 # ============================================================================
@@ -37,13 +38,71 @@ mutable struct CO2SensorCalibration
     Y2::Float64 # CO2 concentration 2
 end
 
+"""
+    CalibratedADC4_20mA
+
+Calibration parameters for a 4-20 mA current loop measured across a burden resistor
+using an analog-to-digital converter.
+
+Fields:
+- `R_burden::Float64`: Burden resistor resistance in ohms (nominal 263.0 Ω).
+- `V_ref::Float64`: ADC reference voltage in volts (nominal 5.000 V).
+- `max_counts::Float64`: Full-scale count range of the ADC (1024.0 for 10-bit SAR).
+"""
+struct CalibratedADC4_20mA
+    R_burden::Float64    # 263.0 ohms
+    V_ref::Float64       # 5.000 V
+    max_counts::Float64  # 1024.0 counts
+end
+
+CalibratedADC4_20mA(; R_burden=263.0, V_ref=5.0, max_counts=1024.0) = CalibratedADC4_20mA(R_burden, V_ref, max_counts)
+
+"""
+    counts_to_mA(adc::CalibratedADC4_20mA, counts::Real)::Float64
+
+Convert raw ADC digital counts to loop current in milliamperes [mA].
+Emits a runtime warning if digital counts reach or exceed full scale (>= 1023.0),
+guarding against clipped saturation above 19.01 mA on a 263 Ω burden resistor with 5.0 V rail.
+Clamps output to [4.0, 20.0] mA.
+"""
+function counts_to_mA(adc::CalibratedADC4_20mA, counts::Real)::Float64
+    counts_f = Float64(counts)
+    V_in = (counts_f / (adc.max_counts - 1.0)) * adc.V_ref
+    I_mA = (V_in / adc.R_burden) * 1000.0
+    # Guard against clipped saturation above 19.01 mA:
+    if counts_f >= 1023.0
+        @warn "ADC input saturated! Current exceeds $(round(adc.V_ref / adc.R_burden * 1000.0, digits=2)) mA."
+    end
+    return clamp(I_mA, 4.0, 20.0)
+end
+
+"""
+    mA_to_co2(I_mA::Real, co2_min::Real=0.0, co2_max::Real=100.0)::Float64
+
+Convert 4-20 mA loop current to dissolved CO2 concentration/saturation [%].
+"""
+function mA_to_co2(I_mA::Real, co2_min::Real=0.0, co2_max::Real=100.0)::Float64
+    frac = (Float64(I_mA) - 4.0) / 16.0
+    return Float64(co2_min) + clamp(frac, 0.0, 1.0) * (Float64(co2_max) - Float64(co2_min))
+end
+
+"""
+    counts_to_co2(adc::CalibratedADC4_20mA, counts::Real, co2_min::Real=0.0, co2_max::Real=100.0)::Float64
+
+Convert raw ADC counts to dissolved CO2 [%] using the calibrated burden resistor model.
+"""
+function counts_to_co2(adc::CalibratedADC4_20mA, counts::Real, co2_min::Real=0.0, co2_max::Real=100.0)::Float64
+    I_mA = counts_to_mA(adc, counts)
+    return mA_to_co2(I_mA, co2_min, co2_max)
+end
+
 Base.@kwdef mutable struct ControllerConfig
     target_co2::Float64 = 5.0
     Kp::Float64 = 10.0
     Ki::Float64 = 0.02
     pwm_window_s::Float64 = 10.0
-    min_on_s::Float64 = 0.0
-    min_off_s::Float64 = 0.0
+    min_on_s::Float64 = 1.0
+    min_off_s::Float64 = 1.0
 end
 
 mutable struct DoserState
@@ -76,9 +135,19 @@ end
 Read the configured ADC channel and convert it directly to dissolved CO2 [%].
 Returns NaN when the raw ADC read fails.
 """
-function read_co2_percent(sp::SerialPort, cal::CO2SensorCalibration; channel::Int=0)
+function read_co2_percent(sp::IO, cal::CO2SensorCalibration; channel::Int=0)
     adc_val = read_adc(sp, channel)
     return isnan(adc_val) ? NaN : adc_to_co2(adc_val, cal)
+end
+
+"""
+    read_co2_percent(sp::IO, adc::CalibratedADC4_20mA; channel::Int=0, co2_min::Real=0.0, co2_max::Real=100.0)
+
+Read configured ADC channel and convert to dissolved CO2 [%] using the burden resistor calibration model.
+"""
+function read_co2_percent(sp::IO, adc::CalibratedADC4_20mA; channel::Int=0, co2_min::Real=0.0, co2_max::Real=100.0)
+    adc_val = read_adc(sp, channel)
+    return isnan(adc_val) ? NaN : counts_to_co2(adc, adc_val, co2_min, co2_max)
 end
 
 """
@@ -122,20 +191,35 @@ function compute_duty_cycle(co2_measured::Float64, co2_target::Float64,
 end
 
 """
-    compute_pwm_times(duty_pct, window_s, min_on_s, min_off_s)
+    compute_pwm_times(duty_pct::Real, window_s::Real,
+                      min_on_s::Real=1.0, min_off_s::Real=1.0)::Tuple{Float64, Float64}
 
 Convert a duty cycle into ON/OFF times while respecting slow-PWM minimum
 switching constraints for a mechanical relay.
+Strictly enforces minimum dwell constraints (t_on, t_off >= 1.0 s) so they cannot be bypassed.
+- If t_on < min_on_s: pulse is suppressed (t_on = 0.0 s) to prevent contact chatter.
+- If t_off < min_off_s: clamped to full-on (t_on = window_s) to prevent contact chatter.
 """
-function compute_pwm_times(duty_pct::Float64, window_s::Float64,
-                           min_on_s::Float64, min_off_s::Float64)::Tuple{Float64, Float64}
-    duty_pct = clamp(duty_pct, 0.0, 100.0)
-    duty_pct == 0.0 && return (0.0, window_s)
-    duty_pct == 100.0 && return (window_s, 0.0)
+function compute_pwm_times(duty_pct::Real, window_s::Real,
+                           min_on_s::Real=1.0, min_off_s::Real=1.0)::Tuple{Float64, Float64}
+    duty = clamp(Float64(duty_pct), 0.0, 100.0)
+    w_s = max(Float64(window_s), 0.0)
+    duty == 0.0 && return (0.0, w_s)
+    duty == 100.0 && return (w_s, 0.0)
 
-    raw_on = duty_pct / 100.0 * window_s
-    on_s = clamp(raw_on, min_on_s, window_s - min_off_s)
-    return (on_s, window_s - on_s)
+    # Strictly enforce minimum dwell constraints >= 1.0 s (cannot be bypassed)
+    effective_min_on = max(Float64(min_on_s), 1.0)
+    effective_min_off = max(Float64(min_off_s), 1.0)
+
+    raw_on = (duty / 100.0) * w_s
+    if raw_on < effective_min_on
+        on_s = 0.0
+    elseif (w_s - raw_on) < effective_min_off
+        on_s = w_s
+    else
+        on_s = raw_on
+    end
+    return (on_s, w_s - on_s)
 end
 
 # ============================================================================
@@ -177,38 +261,66 @@ function read_adc(sp::SerialPort, channel::Int=0)
 end
 
 """
-    set_relay(sp::SerialPort, state::Bool, channel::Int=0)
+    set_relay(sp::IO, state::Bool, channel::Int=0)
 
 Turns the mechanical relay ON or OFF.
 """
-function set_relay(sp::SerialPort, state::Bool, channel::Int=0)
+function set_relay(sp::IO, state::Bool, channel::Int=0)
     if state
-        write(sp, "relay on $channel\r")
+        write(sp, "relay on $channel\r\n")
     else
-        write(sp, "relay off $channel\r")
+        write(sp, "relay off $channel\r\n")
     end
     flush(sp)
 end
 
 """
-    run_pwm_cycle(sp::SerialPort, duty_cycle_percent::Float64, window_s::Float64)
+    execute_guarded_relay_pwm(sp::IO, duty_cycle_pct::Real, window_s::Real, min_dwell_s::Real=1.0; channel::Int=0, sleep_fn::Function=sleep)::Tuple{Float64, Float64}
+
+Executes ONE slow-PWM cycle using sleep() to modulate the mechanical relay while strictly
+enforcing minimum dwell constraints (t_on, t_off >= 1.0 s) to protect mechanical contacts
+against chattering and premature arc erosion (Finding F27 & Remediation Snippet 5.8).
+- If t_on < min_dwell: pulse is suppressed (t_on = 0.0 s, relay remains OFF).
+- If t_off < min_dwell: clamped to full-on (t_on = window_s, t_off = 0.0 s, relay remains ON).
+Returns `(on_time, off_time)`.
+"""
+function execute_guarded_relay_pwm(sp::IO, duty_cycle_pct::Real, window_s::Real, min_dwell_s::Real=1.0; channel::Int=0, sleep_fn::Function=sleep)::Tuple{Float64, Float64}
+    # Enforce minimum dwell constraint (cannot be bypassed below 1.0 s)
+    effective_min_dwell = max(Float64(min_dwell_s), 1.0)
+    w_s = max(Float64(window_s), 0.0)
+    duty = clamp(Float64(duty_cycle_pct), 0.0, 100.0)
+
+    on_time = (duty / 100.0) * w_s
+
+    # Enforce mechanical relay dwell constraints:
+    if on_time < effective_min_dwell
+        on_time = 0.0  # Suppress pulse below minimum dwell to prevent contact chatter
+    elseif (w_s - on_time) < effective_min_dwell
+        on_time = w_s  # Clamp to full-on if off-time violates minimum dwell
+    end
+    off_time = w_s - on_time
+
+    if on_time > 0.0
+        write(sp, "relay on $channel\r\n")
+        flush(sp)
+        sleep_fn(on_time)
+    end
+    if off_time > 0.0
+        write(sp, "relay off $channel\r\n")
+        flush(sp)
+        sleep_fn(off_time)
+    end
+    return (on_time, off_time)
+end
+
+"""
+    run_pwm_cycle(sp::IO, duty_cycle_percent::Real, window_s::Real, min_dwell_s::Real=1.0; channel::Int=0, sleep_fn::Function=sleep)::Tuple{Float64, Float64}
 
 Executes ONE slow-PWM cycle using sleep() to modulate the mechanical relay.
-DO NOT use high frequency.
+Strictly enforces minimum dwell times (t_on, t_off >= 1.0 s) via `execute_guarded_relay_pwm`.
 """
-function run_pwm_cycle(sp::SerialPort, duty_cycle_percent::Float64, window_s::Float64)
-    on_time = (duty_cycle_percent / 100.0) * window_s
-    off_time = window_s - on_time
-    
-    if on_time > 0
-        set_relay(sp, true)
-        sleep(on_time)
-    end
-    
-    if off_time > 0
-        set_relay(sp, false)
-        sleep(off_time)
-    end
+function run_pwm_cycle(sp::IO, duty_cycle_percent::Real, window_s::Real, min_dwell_s::Real=1.0; channel::Int=0, sleep_fn::Function=sleep)::Tuple{Float64, Float64}
+    return execute_guarded_relay_pwm(sp, duty_cycle_percent, window_s, min_dwell_s; channel=channel, sleep_fn=sleep_fn)
 end
 
 """
@@ -312,9 +424,13 @@ function run_standalone(port_name::String, baudrate::Int=115200)
     sp = LibSerialPort.open(port_name, baudrate)
     log_io = nothing
     
-    # Base defaults: roughly ~1V to ~5V translates to 200 to 1023 ADC
-    # We will assume a 0 to 100% reading scale for an arbitrary placeholder.
-    cal = CO2SensorCalibration(215.0, 0.0, 1023.0, 100.0) 
+    # Burden Resistor Calibration Baseline (Finding F26):
+    # For a 4-20 mA sensor across a 263 Ω burden resistor on a 5.0 V ADC:
+    # - 4.0 mA -> 1.052 V -> 215.35 ADC counts (0.0% span)
+    # - 19.01 mA (5.00 V saturation ceiling) -> 1023.0 ADC counts (93.82% span)
+    # The upper 6.18% of sensor span is clipped by ADC rail saturation.
+    cal = CO2SensorCalibration(215.0, 0.0, 1023.0, 93.82)
+    adc_cal = CalibratedADC4_20mA(263.0, 5.0, 1024.0) 
     
     print("Do you wish to run a new 2-point calibration? (y/n): ")
     ans = lowercase(strip(readline()))
@@ -369,9 +485,9 @@ function run_standalone(port_name::String, baudrate::Int=115200)
             
             println("[$timestamp_str] ADC: $adc_val | CO2: $(round(co2_conc, digits=2)) | Target: $(config.target_co2) | PWM: $(round(duty_cycle, digits=1))%")
             
-            # 5. EXECUTE ACTUATOR
+            # 5. EXECUTE ACTUATOR (Strict relay dwell time enforcement >= 1.0 s)
             on_s, off_s = compute_pwm_times(duty_cycle, config.pwm_window_s, config.min_on_s, config.min_off_s)
-            run_pwm_cycle(sp, duty_cycle, on_s + off_s)
+            run_pwm_cycle(sp, duty_cycle, config.pwm_window_s; min_dwell_s=max(config.min_on_s, 1.0))
             
         end
     catch e

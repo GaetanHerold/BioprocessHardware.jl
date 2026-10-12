@@ -15,6 +15,7 @@
 | `TelemetryLogger` | SQLite (WAL) & CSV | SQLite3 / Flat CSV | High-throughput telemetry batching, crash recovery, metadata tagging |
 | `ConfigManager` | JSON / Comments / PnP | System Configuration | Dynamic Windows COM anti-swapping, atomic defaults injection |
 | `CO2Doser` | USB Serial + Relay | Standalone $\text{CO}_2$ Dosing Rig | Two-point calibration and low-frequency PWM gas valve cycling |
+| `VoltcraftDPPS` | USB Serial CDC (9600 baud) | Voltcraft DPPS-16-30 / Manson HCS | DC power source telemetry (`GETD`), CV/CC mode sensing, remote voltage/current control |
 
 ---
 

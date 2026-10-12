@@ -10,6 +10,8 @@ using BioprocessHardware
     include("test_mcu_serial.jl")
     include("test_bioflo_modbus.jl")
     include("test_co2_doser.jl")
+    include("test_yocto_sensor.jl")
+    include("test_voltcraft_dpps.jl")
 
     @testset "SOLRESS Serial Driver & Mock MCU" begin
         # Test CRC and framing

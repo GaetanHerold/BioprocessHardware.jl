@@ -16,7 +16,9 @@ include("bioflo_modbus.jl")
 include("yocto_sensor.jl")
 include("numato_relay.jl")
 include("co2_doser.jl")
+using .CO2Doser: CalibratedADC4_20mA, counts_to_mA, mA_to_co2, counts_to_co2, execute_guarded_relay_pwm, run_pwm_cycle
 include("solress_serial_driver.jl")
+include("voltcraft_dpps.jl")
 
 # Config Manager
 export load_control_parameters, save_params_to_json, apply_parameter_defaults!, strip_json_comments
@@ -42,14 +44,21 @@ export channel_put_drop_oldest!
 export float32_to_bytes, bytes_to_float32, read_bioflo_holding_registers, write_bioflo_holding_register
 export BioFloConn, bioflo_close!, bioflo_read_pvs, bioflo_set_co2_sp!
 export start_bioflo_monitor_task!, start_bioflo_pwm_task!
+export read_with_timeout, BIOFLO_PUMP_DEFAULT_RPM, BIOFLO_PUMP_CALIBRATION_ML_PER_REV, pump_rpm_to_flow_ml_min, pump_flow_ml_min_to_rpm
 
 # Yocto Sensor
-export run_yocto_monitor_task!
+export run_yocto_monitor_task!, restart_yocto_bridge!
 
-# Numato Relay
+# Numato Relay & CO2 Doser
 export read_numato_adc, set_numato_relay
+export CalibratedADC4_20mA, counts_to_mA, mA_to_co2, counts_to_co2, execute_guarded_relay_pwm, run_pwm_cycle
 
 # Submodules
 export CO2Doser
+
+# Voltcraft DPPS Power Supply Driver
+export DPPSReading, DPPSDevice, open_dpps, close_dpps!
+export read_dpps_telemetry, parse_dpps_telemetry, detect_dpps_ports
+export set_dpps_output!, set_dpps_voltage!, set_dpps_current!, query_dpps
 
 end # module BioprocessHardware
