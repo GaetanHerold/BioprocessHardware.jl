@@ -104,32 +104,40 @@ Parse the Manson/Voltcraft `GETD` ASCII response frame: `<VVVV><CCCC><S>` where:
 - `S`: 1-digit status flag (`0` = CV, `1` = CC)
 """
 function parse_dpps_telemetry(raw::AbstractString; timestamp::DateTime=now())::DPPSReading
-    clean = replace(strip(raw), "\r" => "", "\n" => "", "OK" => "")
-    if length(clean) < 9
-        error("Malformed DPPS GETD response (expected ≥ 9 characters): $(repr(raw))")
+    # Robust regex extraction of 4-digit V, 4-digit I, and 1-digit mode flag.
+    # Handles command echoes (e.g. "GETD\r120005000\rOK\r"), varied line endings (\r, \r\n, \n),
+    # and any leading/trailing status bytes.
+    m = match(r"(\d{4})(\d{4})([01])", raw)
+    if m !== nothing
+        v_raw = parse(Int, m.captures[1])
+        i_raw = parse(Int, m.captures[2])
+        mode_char = m.captures[3][1]
+
+        v = v_raw / 100.0
+        i = i_raw / 100.0
+        p = v * i
+        mode = mode_char == '1' ? "CC" : "CV"
+
+        return DPPSReading(timestamp, v, i, p, mode)
     end
 
-    v_str = clean[1:4]
-    i_str = clean[5:8]
-    mode_char = clean[9]
+    clean = replace(strip(raw), "\r" => "", "\n" => "", "OK" => "")
+    if length(clean) >= 9 && all(isdigit, clean[1:9])
+        v_raw = parse(Int, clean[1:4])
+        i_raw = parse(Int, clean[5:8])
+        mode = clean[9] == '1' ? "CC" : "CV"
+        return DPPSReading(timestamp, v_raw / 100.0, i_raw / 100.0, (v_raw / 100.0) * (i_raw / 100.0), mode)
+    end
 
-    v_raw = parse(Int, v_str)
-    i_raw = parse(Int, i_str)
-
-    v = v_raw / 100.0
-    i = i_raw / 100.0
-    p = v * i
-    mode = mode_char == '1' ? "CC" : "CV"
-
-    return DPPSReading(timestamp, v, i, p, mode)
+    error("Malformed DPPS GETD response (expected 9 telemetry characters): $(repr(raw))")
 end
 
 """
-    query_dpps(dev::DPPSDevice, cmd::String; timeout_ms::Int=1000)::String
+    query_dpps(dev::DPPSDevice, cmd::String; timeout_ms::Int=1200)::String
 
-Send an ASCII command terminated by `\\r` and wait for the response ending with `OK\\r`.
+Send an ASCII command terminated by `\\r` and wait for the response ending with `OK\\r` or `OK\\r\\n`.
 """
-function query_dpps(dev::DPPSDevice, cmd::String; timeout_ms::Int=1000)::String
+function query_dpps(dev::DPPSDevice, cmd::String; timeout_ms::Int=1200)::String
     if dev.is_mock
         if cmd == "GETD"
             v_int = round(Int, dev.mock_voltage * 100)
@@ -169,7 +177,14 @@ function query_dpps(dev::DPPSDevice, cmd::String; timeout_ms::Int=1000)::String
         if bytesavailable(sp) > 0
             b = read(sp, 1)
             append!(buf, b)
-            if length(buf) >= 3 && String(buf[end-2:end]) == "OK\r"
+            s = String(buf)
+            # Break as soon as "OK" followed by any whitespace or newline is received
+            if occursin("OK", s)
+                # Drain any remaining bytes in flight (up to 20ms)
+                sleep(0.02)
+                while bytesavailable(sp) > 0
+                    append!(buf, read(sp, 1))
+                end
                 break
             end
         else
@@ -177,8 +192,10 @@ function query_dpps(dev::DPPSDevice, cmd::String; timeout_ms::Int=1000)::String
         end
     end
     raw = String(buf)
-    endswith(raw, "OK\r") || error("DPPS command '$cmd' timed out or received incomplete response: $(repr(raw))")
-    return strip(replace(raw, "OK\r" => ""))
+    if !occursin("OK", raw)
+        error("DPPS command '$cmd' timed out on port '$(dev.port_name)' after $(timeout_ms)ms. Raw bytes received: $(repr(raw))")
+    end
+    return strip(replace(raw, r"OK[\r\n]*" => ""))
 end
 
 """
@@ -200,14 +217,24 @@ function open_dpps(port_name::String="COM4";
     println("[INFO] [DPPS] Opening serial connection to $port_name at $baudrate baud...")
     sp = LibSerialPort.open(port_name, baudrate)
     LibSerialPort.set_read_timeout(sp, 1000)
+
+    # Force 8-N-1 and disable hardware flow control
+    try
+        LibSerialPort.sp_set_flowcontrol(sp.ref, LibSerialPort.SP_FLOWCONTROL_NONE)
+        LibSerialPort.sp_set_bits(sp.ref, 8)
+        LibSerialPort.sp_set_parity(sp.ref, LibSerialPort.SP_PARITY_NONE)
+        LibSerialPort.sp_set_stopbits(sp.ref, 1)
+    catch
+    end
     dev.sp = sp
 
     # Query model limits via GMAX
     try
-        res = query_dpps(dev, "GMAX"; timeout_ms=800)
-        if length(res) >= 6
-            dev.v_max = parse(Int, res[1:3]) / 10.0
-            dev.i_max = parse(Int, res[4:6]) / 10.0
+        res = query_dpps(dev, "GMAX"; timeout_ms=1000)
+        m_gmax = match(r"(\d{3})(\d{3})", res)
+        if m_gmax !== nothing
+            dev.v_max = parse(Int, m_gmax.captures[1]) / 10.0
+            dev.i_max = parse(Int, m_gmax.captures[2]) / 10.0
             println("[INFO] [DPPS] Connected. Limits: V_max = $(dev.v_max) V, I_max = $(dev.i_max) A")
         end
     catch e

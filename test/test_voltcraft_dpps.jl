@@ -36,6 +36,20 @@ using BioprocessHardware
         @test rmax.current_A == 30.0
         @test rmax.power_W ≈ 480.0
 
+        # CRLF response variant (\r\n)
+        raw_crlf = "120005000\r\nOK\r\n"
+        r_crlf = parse_dpps_telemetry(raw_crlf)
+        @test r_crlf.voltage_V == 12.0
+        @test r_crlf.current_A == 5.0
+        @test r_crlf.mode == "CV"
+
+        # Echoed command variant (e.g. "GETD\r120005000\rOK\r")
+        raw_echo = "GETD\r120005000\rOK\r"
+        r_echo = parse_dpps_telemetry(raw_echo)
+        @test r_echo.voltage_V == 12.0
+        @test r_echo.current_A == 5.0
+        @test r_echo.mode == "CV"
+
         # Corrupted / short payload raises error
         @test_throws ErrorException parse_dpps_telemetry("1200")
         @test_throws ErrorException parse_dpps_telemetry("")
