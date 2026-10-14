@@ -38,24 +38,7 @@ mutable struct CO2SensorCalibration
     Y2::Float64 # CO2 concentration 2
 end
 
-"""
-    CalibratedADC4_20mA
-
-Calibration parameters for a 4-20 mA current loop measured across a burden resistor
-using an analog-to-digital converter.
-
-Fields:
-- `R_burden::Float64`: Burden resistor resistance in ohms (nominal 263.0 Ω).
-- `V_ref::Float64`: ADC reference voltage in volts (nominal 5.000 V).
-- `max_counts::Float64`: Full-scale count range of the ADC (1024.0 for 10-bit SAR).
-"""
-struct CalibratedADC4_20mA
-    R_burden::Float64    # 263.0 ohms
-    V_ref::Float64       # 5.000 V
-    max_counts::Float64  # 1024.0 counts
-end
-
-CalibratedADC4_20mA(; R_burden=263.0, V_ref=5.0, max_counts=1024.0) = CalibratedADC4_20mA(R_burden, V_ref, max_counts)
+using ..ADC4_20mA: CalibratedADC4_20mA
 
 """
     counts_to_mA(adc::CalibratedADC4_20mA, counts::Real)::Float64
@@ -239,20 +222,18 @@ function read_adc(sp::SerialPort, channel::Int=0)
     write(sp, cmd)
     
     # Wait for the device to respond
-    sleep(0.1)
+    sleep(0.08)
     
     response = String(read(sp))
 
-    # The device may echo the command and prompt text; choose the last plausible ADC value.
-    candidates = collect(eachmatch(r"\b\d{1,4}\b", response))
-    for m in Iterators.reverse(candidates)
-        v = try
-            parse(Int, m.match)
-        catch
-            continue
-        end
-        if 0 <= v <= 1023
-            return Float64(v)
+    # Finding S2: Ensure command echo (e.g. "adc read 0") is never parsed as ADC count
+    for line in split(response, r"[\r\n]+")
+        s = strip(line)
+        if !isempty(s) && !startswith(s, "adc") && s != ">" && occursin(r"^\d{1,4}$", s)
+            v = tryparse(Int, s)
+            if v !== nothing && 0 <= v <= 1023
+                return Float64(v)
+            end
         end
     end
 
@@ -315,12 +296,15 @@ end
 
 """
     run_pwm_cycle(sp::IO, duty_cycle_percent::Real, window_s::Real, min_dwell_s::Real=1.0; channel::Int=0, sleep_fn::Function=sleep)::Tuple{Float64, Float64}
+    run_pwm_cycle(sp::IO, duty_cycle_percent::Real, window_s::Real; min_dwell_s::Real=1.0, channel::Int=0, sleep_fn::Function=sleep)::Tuple{Float64, Float64}
 
 Executes ONE slow-PWM cycle using sleep() to modulate the mechanical relay.
 Strictly enforces minimum dwell times (t_on, t_off >= 1.0 s) via `execute_guarded_relay_pwm`.
 """
-function run_pwm_cycle(sp::IO, duty_cycle_percent::Real, window_s::Real, min_dwell_s::Real=1.0; channel::Int=0, sleep_fn::Function=sleep)::Tuple{Float64, Float64}
-    return execute_guarded_relay_pwm(sp, duty_cycle_percent, window_s, min_dwell_s; channel=channel, sleep_fn=sleep_fn)
+function run_pwm_cycle(sp::IO, duty_cycle_percent::Real, window_s::Real, min_dwell_pos::Union{Real, Nothing}=nothing;
+                       min_dwell_s::Real=1.0, channel::Int=0, sleep_fn::Function=sleep)::Tuple{Float64, Float64}
+    effective_dwell = min_dwell_pos !== nothing ? min_dwell_pos : min_dwell_s
+    return execute_guarded_relay_pwm(sp, duty_cycle_percent, window_s, effective_dwell; channel=channel, sleep_fn=sleep_fn)
 end
 
 """

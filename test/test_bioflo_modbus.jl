@@ -90,4 +90,40 @@ using BioprocessHardware
     @test isapprox(pump_rpm_to_flow_ml_min(30.0), 30.0; atol=1e-5)
     @test isapprox(pump_flow_ml_min_to_rpm(30.0), 30.0f0; atol=1e-5)
     @test isapprox(pump_rpm_to_flow_ml_min(20.0; k_pump=0.8), 16.0; atol=1e-5)
+
+    # ========================================================================
+    # Finding H8: Documented Register Map Constants
+    # ========================================================================
+    @test REG_TEMP == 2
+    @test REG_PH == 4
+    @test REG_DCO2 == 48
+    @test REG_PUMP1 == 76
+    @test REG_PUMP2 == 78
+    @test REG_PUMP3 == 80
+
+    # ========================================================================
+    # Finding B3: Modbus Exception Frame Handling (9 bytes total)
+    # ========================================================================
+    # FC03 exception response: TID=1, Proto=0, Len=3, Unit=1, FC=0x83, Code=0x02
+    exc_frame = UInt8[0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x01, 0x83, 0x02]
+    @test length(exc_frame) == 9
+    exc_fc = exc_frame[8]
+    exc_code = exc_frame[9]
+    @test exc_fc == 0x83
+    @test (exc_fc & 0x80) != 0
+    @test exc_code == 0x02
+    exc_obj = ModbusException(exc_fc, exc_code)
+    @test occursin("ILLEGAL_DATA_ADDRESS", sprint(showerror, exc_obj))
+
+    # ========================================================================
+    # Actuator Contract on BioFloDevice
+    # ========================================================================
+    isdefined(Main, :test_actuator_contract) || include("contract.jl")
+    test_actuator_contract(
+        () -> open_bioflo("127.0.0.1"; mock=true),
+        setpoint=20.0,
+        out_of_range=150.0,
+        safe_value=0.0,
+        label="BioFloDevice"
+    )
 end

@@ -3,6 +3,8 @@ using JSON3
 using Dates
 using BioprocessHardware
 
+isdefined(Main, :test_sensor_contract) || include("contract.jl")
+
 @testset "Yocto 4-20mA Sensor & Staleness Watchdog" begin
     mktempdir() do tmpdir
         plots_dir = joinpath(tmpdir, "plots")
@@ -78,5 +80,24 @@ with open("$cache_file", "w") as f:
         # Clean shutdown
         keep_running[] = false
         wait(task)
+
+        # 4. Common Sensor Contract on YoctoDevice
+        test_sensor_contract(
+            () -> open_yocto(cache_file; mock=true),
+            label="YoctoDevice"
+        )
+
+        # 5. NAMUR NE43 broken wire and overrange classification
+        dev_mock = open_yocto(cache_file; mock=true)
+        dev_mock.mock_mA = 2.5 # Broken wire < 3.6 mA
+        r_broken = read_measurement(dev_mock)
+        @test r_broken.status == STATUS_UNDERRANGE
+
+        dev_mock.mock_mA = 22.5 # Overrange > 21.0 mA
+        r_over = read_measurement(dev_mock)
+        @test r_over.status == STATUS_OVERRANGE
+
+        close_yocto!(dev_mock)
+        @test !isconnected(dev_mock)
     end
 end

@@ -92,23 +92,70 @@ using BioprocessHardware
         @test set_dpps_output!(dev, false) == true
         @test dev.mock_output_on == false
 
-        # Test Telemetry Reading from Mock
+        # Test Telemetry Reading from Mock: when output is OFF, measured voltage and current are 0.0
         dev.mock_voltage = 10.0
         dev.mock_current = 2.5
         dev.mock_mode = "CV"
-        reading = read_dpps_telemetry(dev)
-        @test reading.voltage_V == 10.0
-        @test reading.current_A == 2.5
-        @test reading.power_W ≈ 25.0
-        @test reading.mode == "CV"
+        reading_off = read_dpps_telemetry(dev)
+        @test reading_off.voltage_V == 0.0
+        @test reading_off.current_A == 0.0
+        @test reading_off.power_W == 0.0
+
+        # When output is ON, measured values reflect active supply
+        set_dpps_output!(dev, true)
+        reading_on = read_dpps_telemetry(dev)
+        @test reading_on.voltage_V == 10.0
+        @test reading_on.current_A == 2.5
+        @test reading_on.power_W ≈ 25.0
+        @test reading_on.mode == "CV"
+
+        # Generic driver interface
+        m = read_measurement(dev)
+        @test m isa Reading
+        @test m.voltage == 10.0
+        @test m.current == 2.5
+        @test m.units.voltage == "V"
+
+        # Test write_setpoint! with voltage
+        res = write_setpoint!(dev, 8.5)
+        @test res.ok == true
+        @test dev.mock_voltage == 8.5
+
+        # Test write_setpoint! with NamedTuple
+        res2 = write_setpoint!(dev, (voltage=6.0, current=2.0, output=true))
+        @test res2.ok == true
+        @test dev.mock_voltage == 6.0
+        @test dev.mock_current == 2.0
+        @test dev.mock_output_on == true
+
+        # Test safe_state!
+        safe_state!(dev)
+        @test dev.mock_output_on == false
+        @test dev.mock_voltage == 0.0
 
         # Close Mock
         close_dpps!(dev)
         @test dev.sp === nothing
+        @test !isconnected(dev)
     end
 
     @testset "3. Port Enumeration" begin
         ports = detect_dpps_ports()
         @test isa(ports, Vector{String})
+    end
+
+    @testset "4. Common Actuator Contract" begin
+        include("contract.jl")
+        test_actuator_contract(
+            () -> begin
+                d = open_dpps("COM_TEST"; mock=true, v_max=16.0, i_max=30.0)
+                set_dpps_output!(d, true)
+                return d
+            end;
+            setpoint=12.0,
+            out_of_range=50.0,
+            safe_value=0.0,
+            label="VoltcraftDPPS"
+        )
     end
 end

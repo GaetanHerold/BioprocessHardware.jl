@@ -117,4 +117,62 @@ using BioprocessHardware
     @test on_t3 == 5.0
     @test off_t3 == 5.0
     @test String(take!(io_valid)) == "relay on 0\r\nrelay off 0\r\n"
+
+    # CD12 (Finding B1): Keyword argument dispatch for min_dwell_s in run_pwm_cycle
+    io_kw = IOBuffer()
+    on_kw, off_kw = run_pwm_cycle(io_kw, 50.0, 10.0; min_dwell_s=2.0, sleep_fn=mock_sleep)
+    @test on_kw == 5.0
+    @test off_kw == 5.0
+
+    # ========================================================================
+    # Finding S1: NAMUR NE43 broken wire detection (< 3.6 mA)
+    # ========================================================================
+    @test ADC4_20mA.classify_loop_current(0.0) == STATUS_UNDERRANGE
+    @test ADC4_20mA.classify_loop_current(2.5) == STATUS_UNDERRANGE
+    @test ADC4_20mA.classify_loop_current(4.0) == STATUS_OK
+    @test ADC4_20mA.classify_loop_current(12.0) == STATUS_OK
+    @test ADC4_20mA.classify_loop_current(20.0) == STATUS_OK
+    @test ADC4_20mA.classify_loop_current(22.0) == STATUS_OVERRANGE
+
+    val_broken, status_broken = ADC4_20mA.counts_to_engineering(adc_default, 0.0)
+    @test status_broken == STATUS_UNDERRANGE
+    @test isnan(val_broken)
+
+    val_good, status_good = ADC4_20mA.counts_to_engineering(adc_default, 600.0)
+    @test status_good == STATUS_OK
+    @test !isnan(val_good)
+
+    # ========================================================================
+    # Finding S2: Numato echo-stripping & ADC channel isolation
+    # ========================================================================
+    # Echo-only response (e.g. "adc read 0\r\n") must NOT return channel number 0.0
+    # Create Numato mock and test
+    numato_dev = open_numato("COM3"; mock=true, relay_channel=0, adc_channel=0)
+    @test numato_dev.is_mock == true
+    @test read_adc(numato_dev) == 215.0
+
+    # Test relay switching
+    @test set_relay!(numato_dev, true) == true
+    @test numato_dev.mock_relay_state == true
+    @test set_relay!(numato_dev, false) == true
+    @test numato_dev.mock_relay_state == false
+
+    # Test common driver contract on NumatoDevice
+    include("contract.jl")
+    test_actuator_contract(
+        () -> open_numato("COM_MOCK"; mock=true),
+        setpoint=1.0,
+        out_of_range=2.0,
+        safe_value=0.0,
+        label="NumatoDevice"
+    )
+
+    # Wear tracker tests (Finding S4)
+    tracker = RelayWearTracker(100)
+    @test tracker.total_cycles == 0
+    record_switch!(tracker)
+    @test tracker.total_cycles == 1
+
+    close_numato!(numato_dev)
+    @test !isconnected(numato_dev)
 end

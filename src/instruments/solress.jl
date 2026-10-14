@@ -1,14 +1,33 @@
 # ==============================================================================
 # SOLRESS Counterpressure Valve MCU — Host Serial Driver & Mock Hardware
 # ==============================================================================
-# Manages bidirectional USB-serial communication with the ESP32 MCU,
-# background telemetry streaming at 10 Hz, CRC-16-CCITT validation,
-# thread-safe actuator dispatch, and in-memory simulated hardware.
+# Driver for the SOLRESS counterpressure control MCU (ESP32-S3). Manages
+# bidirectional serial communication, CRC-16-CCITT packet framing,
+# sequence-numbered command dispatch, 10 Hz telemetry streaming, and in-memory
+# high-fidelity simulation.
 # ==============================================================================
 
-using LibSerialPort
+module Solress
+
 using Dates
 using Printf
+using LibSerialPort
+
+using ..BioprocessHardware: AbstractActuator, AbstractTransport, SerialTransport, MockTransport
+using ..BioprocessHardware: Reading, ReadingStatus, STATUS_OK, STATUS_FAULT, STATUS_OVERRANGE, STATUS_UNDERRANGE, DeviceInfo
+using ..BioprocessHardware: Health, HEALTH_OK, HEALTH_FAULT
+using ..BioprocessHardware: SetpointResult, DeviceError, DeviceTimeout, DeviceProtocolError, DeviceFault, DeviceNotConnected
+using ..BioprocessHardware: write_bytes!, read_until, flush_input!, close!, bytes_ready, read_ready
+import ..BioprocessHardware: isconnected, identify, healthcheck, read_measurement, write_setpoint!, safe_state!, close_device!
+
+export SOLRESSTelemetry, SolressTelemetry
+export SolressSerialDriver, SolressDevice, MockSolressMCU
+export open_solress_driver, close_solress_driver!, open_solress, close_solress!
+export set_valve_position!, home_valve!, emergency_stop!
+export read_telemetry, is_healthy, reconnect_solress_driver!
+export solress_crc16, format_solress_packet, parse_solress_packet, detect_solress_ports
+export start_mock_mcu!, stop_mock_mcu!, step_simulation!, inject_slip_fault!, inject_overpressure_fault!
+export channel_put_drop_oldest!
 
 # ------------------------------------------------------------------------------
 # 1. CRC-16-CCITT & Packet Codec
@@ -75,12 +94,10 @@ function parse_solress_packet(line::AbstractString)
 
     body, crc_str = parts[1], parts[2]
 
-    # Validate non-empty body (matching C++ firmware INVALID_BODY_LENGTH)
     if isempty(body) || length(body) == 0
         return (valid=false, type="", fields=String[], raw_crc=String(crc_str), error="EMPTY_BODY", error_reason="EMPTY_BODY")
     end
 
-    # Validate CRC format (must be exactly 4 hex characters)
     if length(crc_str) != 4
         return (valid=false, type="", fields=String[], raw_crc=String(crc_str), error="INVALID_CRC_FORMAT", error_reason="INVALID_CRC_FORMAT")
     end
@@ -103,7 +120,6 @@ end
 
 """
     SOLRESSTelemetry
-
 Structured telemetry frame received from the SOLRESS ESP32 unit at 10 Hz.
 """
 struct SOLRESSTelemetry
@@ -129,8 +145,6 @@ const SolressTelemetry = SOLRESSTelemetry
 
 """
     parse_solress_telemetry(fields::Vector{String})::SOLRESSTelemetry
-
-Decodes comma-separated fields from a validated `\$TEL` frame.
 """
 function parse_solress_telemetry(fields::Vector{String})::SOLRESSTelemetry
     if length(fields) < 12
@@ -178,14 +192,6 @@ end
 # 3. High-Fidelity Mock ESP32 MCU
 # ------------------------------------------------------------------------------
 
-"""
-    channel_put_drop_oldest!(channel::Channel{T}, item) where T
-
-Thread-safe circular channel write that drops the oldest unread element
-if the channel is at capacity (`Base.n_avail(channel) >= channel.sz_max`).
-Guarantees that `put!` never blocks the calling thread or task, preventing
-deadlocks when called while holding locks (such as `MockSolressMCU.lock`).
-"""
 function channel_put_drop_oldest!(channel::Channel{T}, item) where T
     lock(channel) do
         if !isopen(channel)
@@ -199,13 +205,6 @@ function channel_put_drop_oldest!(channel::Channel{T}, item) where T
     return item
 end
 
-"""
-    MockSolressMCU
-
-High-fidelity in-memory simulated SOLRESS ESP32 MCU.
-Emulates stepper dynamics, AS5600 encoder unwrapping, gentle stall-homing,
-packet decoding, CRC validation, and 10 Hz telemetry streaming.
-"""
 mutable struct MockSolressMCU
     target_steps::Int
     actual_steps::Int
@@ -230,214 +229,169 @@ mutable struct MockSolressMCU
 
     function MockSolressMCU(; pressure_bar::Float64=0.25, level_mm::Float64=50.0)
         new(
-            0,                      # target_steps
-            0,                      # actual_steps
-            0.0,                    # valve_pct
-            pressure_bar,           # pressure_bar
-            level_mm,               # level_mm
-            0,                      # raw_angle
-            0,                      # turns
-            false,                  # is_homed
-            false,                  # is_moving
-            false,                  # is_slip_detected
-            false,                  # is_estop
-            false,                  # is_overpressure
-            1000.0,                 # motor_speed_sps
-            UInt32(0),              # sequence
-            time(),                 # start_time
-            Channel{String}(64),    # rx_channel (NUC -> Mock)
-            Channel{String}(128),   # tx_channel (Mock -> NUC)
-            Ref{Bool}(false),       # keep_running
-            nothing,                # sim_task
-            ReentrantLock()         # lock
+            0,
+            0,
+            0.0,
+            pressure_bar,
+            level_mm,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            1000.0,
+            UInt32(0),
+            time(),
+            Channel{String}(64),
+            Channel{String}(128),
+            Ref{Bool}(false),
+            nothing,
+            ReentrantLock()
         )
     end
 end
 
-# Property Accessors supporting simulated_pressure_bar, target_microsteps, actual_microsteps, and max_microsteps
-function Base.getproperty(mock::MockSolressMCU, s::Symbol)
-    if s === :simulated_pressure_bar
-        return getfield(mock, :pressure_bar)
-    elseif s === :target_microsteps
-        return getfield(mock, :target_steps)
-    elseif s === :actual_microsteps
-        return getfield(mock, :actual_steps)
-    elseif s === :max_microsteps
-        return VALVE_STROKE_STEPS
-    else
-        return getfield(mock, s)
-    end
-end
-
-function Base.setproperty!(mock::MockSolressMCU, s::Symbol, val)
-    if s === :simulated_pressure_bar
-        return setfield!(mock, :pressure_bar, Float64(val))
-    elseif s === :target_microsteps
-        return setfield!(mock, :target_steps, Int(val))
-    elseif s === :actual_microsteps
-        return setfield!(mock, :actual_steps, Int(val))
-    elseif s === :max_microsteps
-        error("Property :max_microsteps is read-only")
-    else
-        return setfield!(mock, s, convert(fieldtype(MockSolressMCU, s), val))
-    end
-end
-
-function Base.propertynames(::MockSolressMCU, private::Bool=false)
-    return (fieldnames(MockSolressMCU)..., :simulated_pressure_bar, :target_microsteps, :actual_microsteps, :max_microsteps)
-end
-
-"""
-    start_mock_mcu!(mock::MockSolressMCU)
-
-Starts background 50 Hz simulation and 10 Hz telemetry streaming on mock MCU.
-"""
 function start_mock_mcu!(mock::MockSolressMCU)
     mock.keep_running[] = true
-    emit_mock_telemetry!(mock)
+    mock.start_time = time()
     mock.sim_task = @async begin
-        dt = 0.02 # 50 Hz simulation tick
-        last_tel_time = time()
+        dt = 0.02
+        telemetry_interval = 0.1
+        last_telem = time()
+
         while mock.keep_running[]
-            t0 = time()
-            try
+            t_now = time()
+
+            lock(mock.lock) do
+                while isready(mock.rx_channel)
+                    raw_line = take!(mock.rx_channel)
+                    process_mock_command!(mock, raw_line)
+                end
+
                 step_simulation!(mock, dt)
 
-                # Emit 10 Hz telemetry
-                now_t = time()
-                if (now_t - last_tel_time) >= 0.10
-                    last_tel_time = now_t
+                if (t_now - last_telem) >= telemetry_interval
                     emit_mock_telemetry!(mock)
+                    last_telem = t_now
                 end
-            catch e
-                @debug "Mock MCU loop error: $e"
             end
 
-            elapsed = time() - t0
-            sleep_time = max(0.001, dt - elapsed)
-            sleep(sleep_time)
+            sleep(dt)
         end
     end
-    return mock
 end
 
-"""
-    stop_mock_mcu!(mock::MockSolressMCU)
-"""
 function stop_mock_mcu!(mock::MockSolressMCU)
     mock.keep_running[] = false
-    if mock.sim_task !== nothing
-        try
-            # Yield to give task time to exit
-            sleep(0.05)
-        catch
-        end
+    try
+        close(mock.rx_channel)
+        close(mock.tx_channel)
+    catch
     end
 end
 
-"""
-    step_simulation!(mock::MockSolressMCU, dt::Float64)
-
-Executes one tick of physics, autonomous safety watchdog, and command processing for the mock MCU.
-Matches ESP32 FreeRTOS dual-core tasks: Task_SensorSampling (Core 1) and Task_SafetyWatchdog (Core 0).
-"""
 function step_simulation!(mock::MockSolressMCU, dt::Float64)
-    lock(mock.lock) do
-        # 1. Process incoming commands from NUC
-        while isready(mock.rx_channel)
-            raw_line = take!(mock.rx_channel)
-            process_mock_command!(mock, raw_line)
-        end
+    if mock.is_estop
+        mock.is_moving = false
+        mock.valve_pct = 100.0
+        return
+    end
 
-        # 2. Autonomous Safety Watchdog: Critical Overpressure Trip (P >= 0.60 bar)
-        # Directly emulates ESP32 main.cpp lines 202-210 and motor.cpp emergencyStop()
-        if mock.simulated_pressure_bar >= OVERPRESSURE_TRIP_BAR
-            mock.is_overpressure = true
-            mock.is_estop = true
-            mock.target_microsteps = mock.max_microsteps
-            mock.actual_microsteps = mock.max_microsteps
-            mock.valve_pct = 100.0
+    if mock.is_slip_detected
+        mock.is_moving = false
+        return
+    end
+
+    if mock.actual_steps != mock.target_steps
+        mock.is_moving = true
+        max_delta = round(Int, mock.motor_speed_sps * dt)
+        delta = mock.target_steps - mock.actual_steps
+
+        if abs(delta) <= max_delta
+            mock.actual_steps = mock.target_steps
             mock.is_moving = false
-        elseif mock.actual_steps != mock.target_steps && !mock.is_slip_detected && !mock.is_estop
-            # 3. Update motor motion towards target (inhibited if slip or E-stop is latched)
-            mock.is_moving = true
-            max_delta = round(Int, mock.motor_speed_sps * dt)
-            err = mock.target_steps - mock.actual_steps
-            if abs(err) <= max_delta
-                mock.actual_steps = mock.target_steps
-                mock.is_moving = false
-            else
-                mock.actual_steps += sign(err) * max_delta
-            end
         else
-            mock.is_moving = false
+            mock.actual_steps += sign(delta) * max_delta
         end
 
-        # 4. Synchronize valve percentage and AS5600 encoder registers
-        mock.valve_pct = clamp((mock.actual_steps / 19200.0) * 100.0, 0.0, 100.0)
+        mock.actual_steps = clamp(mock.actual_steps, 0, VALVE_STROKE_STEPS)
+        mock.valve_pct = (mock.actual_steps / VALVE_STROKE_STEPS) * 100.0
+
         total_encoder_counts = round(Int, mock.actual_steps * 1.28)
         mock.turns = total_encoder_counts ÷ 4096
         mock.raw_angle = mod(total_encoder_counts, 4096)
+    else
+        mock.is_moving = false
+    end
+
+    if !mock.is_overpressure
+        mock.pressure_bar = 0.05 + (1.0 - mock.valve_pct / 100.0) * 0.45 + (rand() - 0.5) * 0.005
     end
 end
 
-"""
-    process_mock_command!(mock::MockSolressMCU, line::AbstractString)
-"""
-function process_mock_command!(mock::MockSolressMCU, line::AbstractString)
-    parsed = parse_solress_packet(line)
-    if !parsed.valid
-        err_resp = format_solress_packet("ERR,PKT,$(parsed.error)")
-        channel_put_drop_oldest!(mock.tx_channel, err_resp)
+function process_mock_command!(mock::MockSolressMCU, raw_line::AbstractString)
+    parsed = parse_solress_packet(raw_line)
+    if !parsed.valid || parsed.type != "CMD" || length(parsed.fields) < 2
         return
     end
 
-    if parsed.type != "CMD" || length(parsed.fields) < 2
-        err_resp = format_solress_packet("ERR,PKT,UNRECOGNIZED")
-        channel_put_drop_oldest!(mock.tx_channel, err_resp)
-        return
+    # Check for sequence number (Finding H3)
+    # Formats: CMD,<seq>,<action>,<args...> OR CMD,<action>,<args...>
+    seq_str = ""
+    cmd_name = ""
+    arg_idx = 3
+
+    if length(parsed.fields) >= 3 && tryparse(Int, parsed.fields[2]) !== nothing
+        seq_str = parsed.fields[2]
+        cmd_name = uppercase(parsed.fields[3])
+        arg_idx = 4
+    else
+        cmd_name = uppercase(parsed.fields[2])
+        arg_idx = 3
     end
 
-    cmd_name = uppercase(parsed.fields[2])
-    if cmd_name == "PING"
-        channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("ACK,PING,OK"))
+    ack_prefix = isempty(seq_str) ? "ACK,$cmd_name" : "ACK,$seq_str,$cmd_name"
+    err_prefix = isempty(seq_str) ? "ERR,$cmd_name" : "ERR,$seq_str,$cmd_name"
+
+    if cmd_name == "ID"
+        channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("$ack_prefix,SOLRESS_MCU"))
+    elseif cmd_name == "PING"
+        channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("$ack_prefix,OK"))
     elseif cmd_name == "POS"
-        if length(parsed.fields) >= 3
-            val_pct = tryparse(Float64, parsed.fields[3])
+        if length(parsed.fields) >= arg_idx
+            val_pct = tryparse(Float64, parsed.fields[arg_idx])
             if val_pct === nothing || val_pct < 0.0 || val_pct > 100.0
-                channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("ERR,POS,OUT_OF_RANGE"))
+                channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("$err_prefix,OUT_OF_RANGE"))
             else
                 mock.target_steps = round(Int, (val_pct / 100.0) * 19200)
-                channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("ACK,POS,OK"))
+                channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("$ack_prefix,OK"))
             end
         else
-            channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("ERR,POS,MISSING_ARG"))
+            channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("$err_prefix,MISSING_ARG"))
         end
     elseif cmd_name == "HOME"
-        # Gentle stall-homing simulation
-        channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("ACK,HOME,STARTED"))
-        mock.actual_steps = 160 # 18 deg relief position
+        mock.actual_steps = 160
         mock.target_steps = 160
         mock.is_homed = true
         mock.is_slip_detected = false
-        channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("ACK,HOME,SUCCESS"))
+        channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("$ack_prefix,SUCCESS"))
     elseif cmd_name == "ESTOP"
         mock.is_estop = true
         mock.target_steps = 19200
         mock.actual_steps = 19200
         mock.valve_pct = 100.0
         mock.is_moving = false
-        channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("ACK,ESTOP,SAFE"))
+        channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("$ack_prefix,SAFE"))
+        emit_mock_telemetry!(mock)
     elseif cmd_name == "CFG"
-        channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("ACK,CFG,UPDATED"))
+        channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("$ack_prefix,UPDATED"))
     else
-        channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("ERR,$(cmd_name),UNKNOWN"))
+        channel_put_drop_oldest!(mock.tx_channel, format_solress_packet("ERR,$cmd_name,UNKNOWN"))
     end
 end
 
-"""
-    emit_mock_telemetry!(mock::MockSolressMCU)
-"""
 function emit_mock_telemetry!(mock::MockSolressMCU)
     mock.sequence += 1
     t_ms = round(UInt32, (time() - mock.start_time) * 1000.0)
@@ -508,19 +462,14 @@ function inject_overpressure_fault!(mock::MockSolressMCU, p_bar::Float64=0.65)
 end
 
 # ------------------------------------------------------------------------------
-# 4. SolressSerialDriver Host Interface
+# 4. SolressSerialDriver Host Interface (implements AbstractActuator)
 # ------------------------------------------------------------------------------
 
-"""
-    SolressSerialDriver
-
-Host hardware driver managing USB-serial connection, background reader task,
-thread-safe command dispatch, and auto-reconnection.
-"""
-mutable struct SolressSerialDriver
+mutable struct SolressSerialDriver <: AbstractActuator
     port_name::String
     baudrate::Int
     port::Any
+    transport::Union{AbstractTransport, Nothing}
     is_mock::Bool
     is_connected::Bool
     is_homed::Bool
@@ -535,13 +484,19 @@ mutable struct SolressSerialDriver
     cmd_lock::ReentrantLock
     ack_cond::Threads.Condition
     pending_cmd_id::Ref{String}
+    pending_seq::Ref{UInt32}
     last_ack_response::Ref{String}
     ack_received::Ref{Bool}
+    cmd_seq_counter::Ref{UInt32}
+    info::DeviceInfo
 
     function SolressSerialDriver(port_name::String, baudrate::Int=115200; is_mock::Bool=false)
+        info = DeviceInfo(vendor="SOLRESS", model="Counterpressure MCU", serial=port_name,
+                          firmware="1.0", port=port_name, driver="Solress")
         new(
             port_name,
             baudrate,
+            nothing,
             nothing,
             is_mock,
             false,
@@ -557,27 +512,93 @@ mutable struct SolressSerialDriver
             ReentrantLock(),
             Threads.Condition(ReentrantLock()),
             Ref{String}(""),
+            Ref{UInt32}(0),
             Ref{String}(""),
-            Ref{Bool}(false)
+            Ref{Bool}(false),
+            Ref{UInt32}(0),
+            info
         )
     end
 end
 
+const SolressDevice = SolressSerialDriver
+
+# ------------------------------------------------------------------------------
+# Driver Contract Methods
+# ------------------------------------------------------------------------------
+
+isconnected(dev::SolressSerialDriver) = dev.is_connected
+
+identify(dev::SolressSerialDriver) = dev.info
+
+function healthcheck(dev::SolressSerialDriver)
+    isconnected(dev) || return Health(HEALTH_FAULT, "device not connected")
+    is_healthy(dev) || return Health(HEALTH_FAULT, "device fault or heartbeat timeout")
+    return Health(HEALTH_OK)
+end
+
+function read_measurement(dev::SolressSerialDriver)::Reading
+    isconnected(dev) || throw(DeviceNotConnected(dev.port_name))
+    tel = read_telemetry(dev)
+    if tel === nothing
+        val = (valve_position_pct=NaN, pressure_bar=NaN, level_mm=NaN)
+        units = (valve_position_pct="%", pressure_bar="bar", level_mm="mm")
+        return Reading(val; units=units, status=STATUS_FAULT, source=dev.info)
+    end
+
+    val = (valve_position_pct=tel.valve_position_pct, pressure_bar=tel.pressure_bar, level_mm=tel.level_mm)
+    units = (valve_position_pct="%", pressure_bar="bar", level_mm="mm")
+    status = (tel.is_slip_detected || tel.is_overpressure) ? STATUS_FAULT : STATUS_OK
+    return Reading(val; units=units, status=status, source=dev.info)
+end
+
+function write_setpoint!(dev::SolressSerialDriver, pos_pct::Real)
+    isconnected(dev) || throw(DeviceNotConnected(dev.port_name))
+    val = Float64(pos_pct)
+    if val < 0.0 || val > 100.0
+        cur_pos = dev.last_telemetry === nothing ? 0.0 : dev.last_telemetry.valve_position_pct
+        return SetpointResult(false, val, cur_pos, 0, "setpoint out of bounds [0, 100]")
+    end
+    ok = set_valve_position!(dev, val)
+    return SetpointResult(ok, val, val, 1, ok ? "applied" : "failed")
+end
+
+function safe_state!(dev::SolressSerialDriver)
+    if isconnected(dev)
+        emergency_stop!(dev)
+        sleep(0.05)
+    end
+    return nothing
+end
+
+function close_device!(dev::SolressSerialDriver)
+    safe_state!(dev)
+    close_solress_driver!(dev)
+    return nothing
+end
+
+close_solress!(dev::SolressSerialDriver) = close_device!(dev)
+
+# ------------------------------------------------------------------------------
+# Port Discovery & Handshake (Finding H1)
+# ------------------------------------------------------------------------------
+
 """
     detect_solress_ports()::Dict{String, String}
 
-Dynamically identifies serial ports for ESP32 and USB-UART converters
-across macOS, Linux, and Windows to prevent port swapping.
+Dynamically identifies serial ports for ESP32 and USB-UART converters.
 """
 function detect_solress_ports()::Dict{String, String}
     ports = Dict{String, String}()
 
     if Sys.iswindows()
-        # Fall back to existing Windows detection
-        return detect_windows_com_ports()
+        detected = detect_windows_com_ports()
+        if haskey(detected, "esp32")
+            ports["solress_mcu"] = detected["esp32"]
+        end
+        return ports
     end
 
-    # macOS & Linux dynamic scan
     candidates = String[]
     if Sys.isapple()
         for p in ["/dev/cu.usbserial*", "/dev/cu.SLAB_USBtoUART*", "/dev/cu.wchusbserial*", "/dev/cu.usbmodem*"]
@@ -588,7 +609,7 @@ function detect_solress_ports()::Dict{String, String}
             catch
             end
         end
-    else # Linux
+    else
         for p in ["/dev/ttyACM*", "/dev/ttyUSB*"]
             try
                 for match in glob_ports(p)
@@ -619,19 +640,32 @@ function glob_ports(pattern::String)::Vector{String}
     return matches
 end
 
-"""
-    start_serial_reader_task!(driver::SolressSerialDriver, sp)
+# ------------------------------------------------------------------------------
+# Non-Blocking Background Reader (Finding H5)
+# ------------------------------------------------------------------------------
 
-Spawns the background serial port reader task reading from physical UART.
-"""
 function start_serial_reader_task!(driver::SolressSerialDriver, sp)
     driver.keep_running[] = true
     driver.reader_task = @async begin
+        buf = UInt8[]
         while driver.keep_running[]
             try
                 if isopen(sp) && bytesavailable(sp) > 0
-                    line = readline(sp)
-                    process_incoming_line!(driver, line)
+                    chunk = read(sp)
+                    append!(buf, chunk)
+                    # Bound buffer to prevent memory exhaustion on corrupted stream
+                    if length(buf) > 1024
+                        idx = findlast(==(UInt8('\n')), buf)
+                        buf = idx === nothing ? UInt8[] : buf[idx+1:end]
+                    end
+                    while true
+                        idx = findfirst(==(UInt8('\n')), buf)
+                        idx === nothing && break
+                        line_bytes = buf[1:idx]
+                        buf = buf[idx+1:end]
+                        line = String(line_bytes)
+                        process_incoming_line!(driver, line)
+                    end
                 else
                     sleep(0.01)
                 end
@@ -647,11 +681,6 @@ function start_serial_reader_task!(driver::SolressSerialDriver, sp)
     end
 end
 
-"""
-    start_mock_reader_task!(driver::SolressSerialDriver, mock_hw::MockSolressMCU)
-
-Spawns the background reader task reading from the in-memory mock MCU TX channel.
-"""
 function start_mock_reader_task!(driver::SolressSerialDriver, mock_hw::MockSolressMCU)
     driver.keep_running[] = true
     driver.reader_task = @async begin
@@ -661,11 +690,11 @@ function start_mock_reader_task!(driver::SolressSerialDriver, mock_hw::MockSolre
                     line = take!(mock_hw.tx_channel)
                     process_incoming_line!(driver, line)
                 else
-                    sleep(0.01)
+                    sleep(0.005)
                 end
             catch e
                 @debug "Mock reader task exception: $e"
-                sleep(0.01)
+                sleep(0.005)
             end
         end
     end
@@ -674,11 +703,8 @@ end
 """
     open_solress_driver(; port_name::String="/dev/ttyACM0", baudrate::Int=115200,
                           mock::Bool=false, autodetect::Bool=false)::SolressSerialDriver
-
-Opens the SOLRESS MCU serial driver. If `mock=true`, creates an in-memory
-high-fidelity simulation without requiring physical USB hardware.
 """
-function open_solress_driver(; port_name::String="/dev/ttyACM0", baudrate::Int=115200,
+function open_solress_driver(port_name::String="/dev/ttyACM0"; baudrate::Int=115200,
                                mock::Bool=false, autodetect::Bool=false)::SolressSerialDriver
     resolved_port = port_name
     if autodetect && !mock
@@ -715,11 +741,8 @@ function open_solress_driver(; port_name::String="/dev/ttyACM0", baudrate::Int=1
     return driver
 end
 
-"""
-    close_solress_driver!(driver::SolressSerialDriver)
+open_solress(args...; kwargs...) = open_solress_driver(args...; kwargs...)
 
-Gracefully closes the driver, background reader task, and underlying port/mock.
-"""
 function close_solress_driver!(driver::SolressSerialDriver)
     driver.keep_running[] = false
     driver.is_connected = false
@@ -735,11 +758,10 @@ function close_solress_driver!(driver::SolressSerialDriver)
     end
 end
 
-"""
-    process_incoming_line!(driver::SolressSerialDriver, line::AbstractString)
+# ------------------------------------------------------------------------------
+# Packet Processing & Sequence-Numbered ACK Correlation (Finding H3, H6)
+# ------------------------------------------------------------------------------
 
-Validates CRC-16-CCITT and dispatches parsed packets to telemetry channel.
-"""
 function process_incoming_line!(driver::SolressSerialDriver, line::AbstractString)
     parsed = parse_solress_packet(line)
     if !parsed.valid
@@ -754,6 +776,7 @@ function process_incoming_line!(driver::SolressSerialDriver, line::AbstractStrin
             tel = parse_solress_telemetry(parsed.fields)
             lock(driver.lock) do
                 driver.last_telemetry = tel
+                # Finding H4: is_homed is strictly updated from telemetry, never blindly assumed
                 driver.is_homed = tel.is_homed
             end
             channel_put_drop_oldest!(driver.telemetry_channel, tel)
@@ -761,21 +784,57 @@ function process_incoming_line!(driver::SolressSerialDriver, line::AbstractStrin
             driver.error_count[] += 1
         end
     elseif parsed.type == "ACK"
-        cmd_id = length(parsed.fields) >= 2 ? uppercase(parsed.fields[2]) : ""
-        status = length(parsed.fields) >= 3 ? parsed.fields[3] : "OK"
+        # Check if sequence number is present: ACK,<seq>,<CMD>,<STATUS>
+        ack_seq = UInt32(0)
+        cmd_id = ""
+        status = "OK"
+
+        if length(parsed.fields) >= 4 && tryparse(UInt32, parsed.fields[2]) !== nothing
+            ack_seq = parse(UInt32, parsed.fields[2])
+            cmd_id = uppercase(parsed.fields[3])
+            status = parsed.fields[4]
+        elseif length(parsed.fields) >= 2
+            cmd_id = uppercase(parsed.fields[2])
+            status = length(parsed.fields) >= 3 ? parsed.fields[3] : "OK"
+        end
+
         lock(driver.ack_cond) do
-            if isempty(driver.pending_cmd_id[]) || driver.pending_cmd_id[] == cmd_id
+            # Sequence correlation takes precedence if pending_seq > 0
+            match = if driver.pending_seq[] > 0
+                ack_seq == driver.pending_seq[]
+            else
+                isempty(driver.pending_cmd_id[]) || driver.pending_cmd_id[] == cmd_id
+            end
+
+            if match
                 driver.last_ack_response[] = status
                 driver.ack_received[] = true
                 notify(driver.ack_cond)
             end
         end
     elseif parsed.type == "ERR"
-        cmd_id = length(parsed.fields) >= 2 ? uppercase(parsed.fields[2]) : ""
-        reason = length(parsed.fields) >= 3 ? parsed.fields[3] : "ERROR"
+        err_seq = UInt32(0)
+        cmd_id = ""
+        reason = "ERROR"
+
+        if length(parsed.fields) >= 4 && tryparse(UInt32, parsed.fields[2]) !== nothing
+            err_seq = parse(UInt32, parsed.fields[2])
+            cmd_id = uppercase(parsed.fields[3])
+            reason = parsed.fields[4]
+        elseif length(parsed.fields) >= 2
+            cmd_id = uppercase(parsed.fields[2])
+            reason = length(parsed.fields) >= 3 ? parsed.fields[3] : "ERROR"
+        end
+
         driver.error_count[] += 1
         lock(driver.ack_cond) do
-            if isempty(driver.pending_cmd_id[]) || driver.pending_cmd_id[] == cmd_id
+            match = if driver.pending_seq[] > 0
+                err_seq == driver.pending_seq[]
+            else
+                isempty(driver.pending_cmd_id[]) || driver.pending_cmd_id[] == cmd_id
+            end
+
+            if match
                 driver.last_ack_response[] = "ERR:" * reason
                 driver.ack_received[] = true
                 notify(driver.ack_cond)
@@ -787,42 +846,44 @@ end
 """
     send_driver_command!(driver::SolressSerialDriver, cmd_payload::AbstractString; timeout_s::Float64=2.0)::String
 
-Thread-safe command transmission with CRC framing and response waiting.
+Thread-safe command transmission with sequence numbers and unified ACK handling (Finding H3, H6).
 """
 function send_driver_command!(driver::SolressSerialDriver, cmd_payload::AbstractString; timeout_s::Float64=2.0)::String
     if !driver.is_connected
-        error("SOLRESS driver is not connected to MCU")
+        throw(DeviceNotConnected(driver.port_name))
     end
 
-    packet = format_solress_packet(cmd_payload)
-
-    # 1. Fast Mock Path (< 0.001s latency)
-    if driver.is_mock && driver.mock_mcu !== nothing
-        channel_put_drop_oldest!(driver.mock_mcu.rx_channel, packet)
-        lock(driver.mock_mcu.lock) do
-            while isready(driver.mock_mcu.rx_channel)
-                raw_line = take!(driver.mock_mcu.rx_channel)
-                process_mock_command!(driver.mock_mcu, raw_line)
-            end
-        end
-        return "OK"
-    end
-
-    # 2. Real Hardware Path with Synchronous ACK Handling
-    if driver.port === nothing || !isopen(driver.port)
-        error("Serial port is closed")
-    end
-
+    # Increment command sequence counter for unambiguous ACK matching (Finding H3)
+    seq = (driver.cmd_seq_counter[] += 1)
     tokens = split(strip(cmd_payload), ",")
-    expected_id = length(tokens) >= 2 ? uppercase(tokens[2]) : ""
+    cmd_name = length(tokens) >= 2 ? uppercase(tokens[2]) : ""
+
+    # Frame with sequence number: CMD,<seq>,<action>,<args...>
+    seq_payload = if length(tokens) >= 2 && tokens[1] == "CMD"
+        action_and_args = join(tokens[2:end], ",")
+        "CMD,$seq,$action_and_args"
+    else
+        cmd_payload
+    end
+
+    packet = format_solress_packet(seq_payload)
 
     lock(driver.cmd_lock) do
-        driver.pending_cmd_id[] = expected_id
+        driver.pending_cmd_id[] = cmd_name
+        driver.pending_seq[] = seq
         driver.last_ack_response[] = ""
         driver.ack_received[] = false
 
-        lock(driver.lock) do
-            write(driver.port, packet)
+        if driver.is_mock && driver.mock_mcu !== nothing
+            # Finding H6: Route mock commands through the exact same rx/tx and ACK correlation path
+            channel_put_drop_oldest!(driver.mock_mcu.rx_channel, packet)
+        else
+            if driver.port === nothing || !isopen(driver.port)
+                throw(DeviceNotConnected("Serial port is closed"))
+            end
+            lock(driver.lock) do
+                write(driver.port, packet)
+            end
         end
 
         t0 = time()
@@ -840,24 +901,27 @@ function send_driver_command!(driver::SolressSerialDriver, cmd_payload::Abstract
             finally
                 close(tm)
                 driver.pending_cmd_id[] = ""
+                driver.pending_seq[] = UInt32(0)
             end
         end
 
         if driver.ack_received[]
             if startswith(driver.last_ack_response[], "ERR:")
-                error("SOLRESS MCU command error: $(driver.last_ack_response[])")
+                throw(DeviceProtocolError("SOLRESS MCU command error: $(driver.last_ack_response[])"))
             end
             return driver.last_ack_response[]
         else
-            error("Timeout waiting for ACK response for command $(cmd_payload) after $(timeout_s)s")
+            throw(DeviceTimeout(driver.port_name, "command $(cmd_payload)", timeout_s))
         end
     end
 end
 
+# ------------------------------------------------------------------------------
+# 5. High-Level Commands
+# ------------------------------------------------------------------------------
+
 """
     set_valve_position!(driver::SolressSerialDriver, pos_pct::Real; timeout_s::Float64=2.0)::Bool
-
-Commands valve position (0.0% = hard seated, 100.0% = fully open).
 """
 function set_valve_position!(driver::SolressSerialDriver, pos_pct::Real; timeout_s::Float64=2.0)::Bool
     clamped = clamp(Float64(pos_pct), 0.0, 100.0)
@@ -865,46 +929,43 @@ function set_valve_position!(driver::SolressSerialDriver, pos_pct::Real; timeout
     try
         send_driver_command!(driver, cmd; timeout_s=timeout_s)
         return true
-    catch
+    catch e
+        @debug "set_valve_position! failed" exception=e
         return false
     end
 end
 
 """
     home_valve!(driver::SolressSerialDriver; timeout_s::Float64=10.0)::Bool
-
-Commands gentle stall-homing sequence on the MCU.
 """
 function home_valve!(driver::SolressSerialDriver; timeout_s::Float64=10.0)::Bool
     cmd = "CMD,HOME"
     try
         send_driver_command!(driver, cmd; timeout_s=timeout_s)
-        driver.is_homed = true
+        # Note: driver.is_homed is updated from incoming telemetry or ACK, not fabricated (Finding H4)
         return true
-    catch
+    catch e
+        @debug "home_valve! failed" exception=e
         return false
     end
 end
 
 """
     emergency_stop!(driver::SolressSerialDriver; timeout_s::Float64=2.0)::Bool
-
-Commands emergency valve release (opens valve to 100% and halts movement).
 """
 function emergency_stop!(driver::SolressSerialDriver; timeout_s::Float64=2.0)::Bool
     cmd = "CMD,ESTOP"
     try
         send_driver_command!(driver, cmd; timeout_s=timeout_s)
         return true
-    catch
+    catch e
+        @error "emergency_stop! failed" exception=e
         return false
     end
 end
 
 """
     read_telemetry(driver::SolressSerialDriver)::Union{SOLRESSTelemetry, Nothing}
-
-Returns the latest received telemetry frame, or `nothing` if none received.
 """
 function read_telemetry(driver::SolressSerialDriver)::Union{SOLRESSTelemetry, Nothing}
     lock(driver.lock) do
@@ -914,9 +975,6 @@ end
 
 """
     is_healthy(driver::SolressSerialDriver)::Bool
-
-Evaluates driver health: verified connection, recent heartbeat (< 5.0 s),
-and absence of fatal hardware faults.
 """
 function is_healthy(driver::SolressSerialDriver)::Bool
     if !driver.is_connected
@@ -943,9 +1001,6 @@ end
 
 """
     reconnect_solress_driver!(driver::SolressSerialDriver; max_retries::Int=3)::Bool
-
-Attempts auto-reconnection if serial connection is dropped. Restarts the
-background reader task to ensure telemetry streaming resumes immediately.
 """
 function reconnect_solress_driver!(driver::SolressSerialDriver; max_retries::Int=3)::Bool
     if driver.is_mock
@@ -958,7 +1013,7 @@ function reconnect_solress_driver!(driver::SolressSerialDriver; max_retries::Int
         return true
     end
 
-    for attempt in 1:max_retries
+    for _ in 1:max_retries
         try
             if driver.port !== nothing
                 try LibSerialPort.close(driver.port) catch end
@@ -972,7 +1027,6 @@ function reconnect_solress_driver!(driver::SolressSerialDriver; max_retries::Int
             driver.keep_running[] = true
             driver.last_comm_time[] = time()
 
-            # Restart reader_task if dead/done
             if driver.reader_task === nothing || istaskdone(driver.reader_task)
                 start_serial_reader_task!(driver, sp)
             end
@@ -984,3 +1038,5 @@ function reconnect_solress_driver!(driver::SolressSerialDriver; max_retries::Int
     driver.is_connected = false
     return false
 end
+
+end # module Solress
