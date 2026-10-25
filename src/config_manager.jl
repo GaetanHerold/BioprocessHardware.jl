@@ -2,7 +2,7 @@
 # CONFIGURATION & PARAMETER MANAGER
 # ============================================================================
 # Handles loading, JSON comment-stripping, validation, defaulting, and atomic
-# saving of control parameters for the LUCRA Pilot System.
+# saving of control parameters for bioprocess pilot systems.
 # ============================================================================
 
 using JSON3
