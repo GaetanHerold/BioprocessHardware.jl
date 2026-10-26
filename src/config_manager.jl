@@ -100,9 +100,9 @@ function apply_parameter_defaults!(params::Dict)
         "P_CO2_gas" => 1.0,              # CO₂ partial pressure [atm]
         "Z_succ_avg" => 2.0,             # Average charge of succinate (≈2 at pH 7)
         "Z_carb_avg" => 1.0,             # Average charge of carbonate (≈1 at pH 7)
-        "D_succ_bulk" => 0.783e-9,       # succinate²⁻ bulk diffusivity [m²/s]
-        "D_HCO3_bulk" => 1.185e-9,       # bicarbonate⁻ bulk diffusivity [m²/s]
-        "D_acet_bulk" => 1.089e-9,       # acetate⁻ bulk diffusivity [m²/s]
+        "D_succ_bulk" => 1.049e-9,       # succinate²⁻ bulk diffusivity at 37°C [m²/s]
+        "D_HCO3_bulk" => 1.588e-9,       # bicarbonate⁻ bulk diffusivity at 37°C [m²/s]
+        "D_acet_bulk" => 1.459e-9,       # acetate⁻ bulk diffusivity at 37°C [m²/s]
         "K_Don"       => 1.5,            # Donnan enhancement factor [-]
         "A_mem"       => 0.01,           # Effective AEM area [m²]
         "C_acet_bg"   => 0.0,            # Background acetate [mol/L]
