@@ -1,51 +1,97 @@
 # ============================================================================
 # CONFIGURATION & PARAMETER MANAGER
 # ============================================================================
-# Handles loading, JSON comment-stripping, validation, defaulting, and atomic
-# saving of control parameters for bioprocess pilot systems.
+# Handles loading, string-safe JSONC comment-stripping, type normalization,
+# hardware defaulting, and atomic saving of configuration files.
 # ============================================================================
 
 using JSON3
 
+export strip_json_comments, apply_hardware_defaults!, HARDWARE_PARAMETER_DEFAULTS
+
 """
-    load_control_parameters(filename::String)
+    strip_json_comments(content::AbstractString) -> String
 
-Load control parameters from a JSON file with support for comments and Windows COM port dynamic overrides.
+Strip single-line (`// ...` and `# ...`), multi-line (`/* ... */`) comments, and
+trailing commas from a JSONC string without corrupting `//` or `#` inside quoted
+string literals (e.g., URLs like `"http://127.0.0.1:4444"`).
+"""
+function strip_json_comments(content::AbstractString)::String
+    buf = IOBuffer()
+    chars = collect(content)
+    n = length(chars)
+    i = 1
+    in_string = false
+    escape_next = false
 
-Supports:
-- Single-line comments: // comment or # comment
-- Trailing comments: "key": value  // comment
-- Multi-line comments: /* comment */
+    while i <= n
+        c = chars[i]
+        if in_string
+            write(buf, c)
+            if escape_next
+                escape_next = false
+            elseif c == '\\'
+                escape_next = true
+            elseif c == '"'
+                in_string = false
+            end
+            i += 1
+        else
+            if c == '"'
+                in_string = true
+                write(buf, c)
+                i += 1
+            elseif c == '/' && i < n && chars[i + 1] == '/'
+                # Skip single-line // comment until newline
+                i += 2
+                while i <= n && chars[i] != '\n'
+                    i += 1
+                end
+            elseif c == '#'
+                # Skip single-line # comment until newline
+                i += 1
+                while i <= n && chars[i] != '\n'
+                    i += 1
+                end
+            elseif c == '/' && i < n && chars[i + 1] == '*'
+                # Skip multi-line /* ... */ comment
+                i += 2
+                while i <= n && !(i < n && chars[i] == '*' && chars[i + 1] == '/')
+                    if chars[i] == '\n'
+                        write(buf, '\n')
+                    end
+                    i += 1
+                end
+                i += 2
+            else
+                write(buf, c)
+                i += 1
+            end
+        end
+    end
 
-Returns a `Dict{String,Any}` with all parameters.
-Throws error if file does not exist.
+    cleaned = String(take!(buf))
+    # Remove trailing commas before closing braces/brackets
+    return replace(cleaned, r",(\s*[}\]])" => s"\1")
+end
+
+"""
+    load_control_parameters(filename::String) -> Dict{String,Any}
+
+Load parameters from a JSON/JSONC file with comment stripping and Windows COM port dynamic overrides.
 """
 function load_control_parameters(filename::String)
     if !isfile(filename)
         error("Parameter file not found: $filename")
     end
 
-    # Read file content
     content = read(filename, String)
-
-    # Strip comments for JSON parsing
-    # Remove single-line comments (// ... to end of line)
-    content = replace(content, r"//.*?$"m => "")
-
-    # Remove multi-line comments (/* ... */)
-    content = replace(content, r"/\*.*?\*/"s => "")
-
-    # Remove trailing commas before closing braces/brackets (common error)
-    content = replace(content, r",(\s*[}\]])" => s"\1")
-
-    # Parse cleaned JSON
-    json_obj = JSON3.read(content)
-
-    # Convert to Dict with String keys (JSON3 uses Symbol keys by default)
+    cleaned = strip_json_comments(content)
+    json_obj = JSON3.read(cleaned)
     params = Dict{String,Any}(String(k) => v for (k, v) in pairs(json_obj))
 
     # Apply Windows COM Port Dynamic Anti-Swapping Overrides if on Windows
-    if Sys.iswindows() && isdefined(Main, :detect_windows_com_ports)
+    if Sys.iswindows()
         detected_ports = detect_windows_com_ports()
         if haskey(detected_ports, "esp32")
             old_port = get(params, "serial_port", "not set")
@@ -69,7 +115,8 @@ end
 """
     save_params_to_json(params, filename::String)
 
-Save parameters dictionary to JSON file with pretty formatting.
+Atomically save parameters dictionary to a JSON file with pretty formatting.
+Writes to a temporary file in the same directory and renames atomically via `mv`.
 """
 function save_params_to_json(params, filename::String)
     sanitized = Dict{String, Any}()
@@ -80,115 +127,183 @@ function save_params_to_json(params, filename::String)
             sanitized[string(k)] = v
         end
     end
-    open(filename, "w") do f
-        JSON3.pretty(f, sanitized)
+    dir = dirname(abspath(filename))
+    mkpath(dir)
+    tmp_path = joinpath(dir, ".tmp_" * basename(filename) * "_" * string(getpid()) * "_" * string(time_ns()))
+    try
+        open(tmp_path, "w") do f
+            JSON3.pretty(f, sanitized)
+        end
+        mv(tmp_path, filename; force = true)
+    catch err
+        rm(tmp_path; force = true)
+        rethrow(err)
     end
+    return filename
 end
 
-"""
-    apply_parameter_defaults!(params::Dict)
+"Hardware-only default parameters (ports, channels, 4-20 mA & ADC bounds, PWM timing)."
+const HARDWARE_PARAMETER_DEFAULTS = Dict{String,Any}(
+    "use_new_unit" => true,
+    "co2_max_lpm" => 30.0,
+    "co2_min_continuous_lpm" => 3.0,
+    "co2_low_flow_mode" => "cutoff",
+    "pump_max_L_h" => 10.0,
+    "pump_min" => 0.0,
+    "pump_baseline" => 50.0,
+    "pump_slew_rate_limit" => 20.0,
+    "manual_override_mode" => false,
+    "manual_current_A" => 0.0,
+    "manual_co2_pct" => 0.0,
+    "manual_pump_pct" => 50.0,
+    "co2_setpoint" => 0.0,
+    "co2_actuation_mode" => "mcu",
+    "co2_numato_port" => "COM3",
+    "co2_numato_baudrate" => 115200,
+    "co2_adc_channel" => 0,
+    "co2_relay_channel" => 0,
+    "co2_cal_X1" => 205.0,
+    "co2_cal_Y1" => 0.0,
+    "co2_cal_X2" => 1023.0,
+    "co2_cal_Y2" => 98.71,
+    "co2_pi_Kp" => 10.0,
+    "co2_pi_Ki" => 0.02,
+    "co2_pwm_window_s" => 120.0,
+    "co2_pwm_min_on_s" => 20.0,
+    "co2_pwm_min_off_s" => 20.0,
+    "yocto_mA_min" => 4.0,
+    "yocto_mA_max" => 20.0,
+    "yocto_co2_min" => 0.0,
+    "yocto_co2_max" => 1200.0,
+)
 
-Fill in missing parameters with sensible defaults and enforce Float64 numeric types.
-Modifies params dictionary in-place.
-"""
-function apply_parameter_defaults!(params::Dict)
-    # Define default values for all possible parameters
-    defaults = Dict{String,Any}(
-        "VVM" => 0.1,                    # Vessel volumes per minute (gas flow)
-        "R_gas" => 0.082057,             # Ideal gas constant [L·atm/(mol·K)]
-        "T_K" => 310.15,                 # Temperature [K] (37°C, typical fermentation)
-        "P_CO2_gas" => 1.0,              # CO₂ partial pressure [atm]
-        "Z_succ_avg" => 2.0,             # Average charge of succinate (≈2 at pH 7)
-        "Z_carb_avg" => 1.0,             # Average charge of carbonate (≈1 at pH 7)
-        "D_succ_bulk" => 1.049e-9,       # succinate²⁻ bulk diffusivity at 37°C [m²/s]
-        "D_HCO3_bulk" => 1.588e-9,       # bicarbonate⁻ bulk diffusivity at 37°C [m²/s]
-        "D_acet_bulk" => 1.459e-9,       # acetate⁻ bulk diffusivity at 37°C [m²/s]
-        "K_Don"       => 1.5,            # Donnan enhancement factor [-]
-        "A_mem"       => 0.01,           # Effective AEM area [m²]
-        "C_acet_bg"   => 0.0,            # Background acetate [mol/L]
-        "J_max_OH" => 1e-4,              # Maximum OH⁻ flux [mol/L/s]
-        "controlLim" => 5.0,             # Maximum control output [0-5 A]
-        "tau_adapt" => 600.0,            # Adaptation time constant [s]
-        "gamma_adapt" => 0.0,            # Adaptation gain (0 = disabled)
-        "deadband" => 0.05,              # Adaptation deadband [pH units]
-        "pH_initial_non_measured" => NaN, # Initial pH for non-measured vessel
-        "pH_ferm_offset" => 0.0,         # Offline pH offset for fermenter probe [pH units]
-        "pH_extr_offset" => 0.0,         # Offline pH offset for extraction probe [pH units]
-        "initial_current" => 0.0,        # Initial control output
-        "reset_parameters" => false,     # Flag for hard reset
-        "soft_reset_parameters" => false, # Flag for soft reset
-        "target_pH" => 7.2,              # pH setpoint
-        "control_interval" => 1.0,       # Time between control executions [s]
-        "time_resolution" => 0.1,        # Time step for model discretization [s]
-        "use_new_unit" => true,          # Standalone new hardware interface mode
-        "co2_max_lpm" => 30.0,           # MFC full-scale flow rate [L/min]
-        "co2_min_continuous_lpm" => 3.0, # MFC minimum continuous flow [L/min]
-        "co2_low_flow_mode" => "cutoff", # "cutoff" or "pwm"
-        "pump_max_L_h" => 10.0,          # Filtrate pump maximum flow rate [L/h]
-        "pump_min" => 0.0,               # Minimum pump percentage [0.0 = allow stop]
-        "pump_baseline" => 50.0,         # Baseline pump setpoint [%]
-        "pump_slew_rate_limit" => 20.0,  # Pump slew rate limit [%/min]
-        "manual_override_mode" => false, # Constant output test mode (bypasses feedback)
-        "manual_current_A" => 0.0,       # Constant current setpoint [A] in manual mode
-        "manual_co2_pct" => 0.0,         # Constant CO2 setpoint [%] in manual mode
-        "manual_pump_pct" => 50.0,       # Constant filtrate pump setpoint [%] in manual mode
-        "co2_setpoint" => 0.0,           # CO₂ setpoint (%)
-        "co2_actuation_mode" => "mcu",   # mcu | local_pwm
-        "co2_numato_port" => "COM3",
-        "co2_numato_baudrate" => 115200,
-        "co2_adc_channel" => 0,
-        "co2_relay_channel" => 0,
-        "co2_cal_X1" => 205.0,
-        "co2_cal_Y1" => 0.0,
-        "co2_cal_X2" => 1023.0,
-        "co2_cal_Y2" => 98.71,
-        "co2_pi_Kp" => 10.0,
-        "co2_pi_Ki" => 0.02,
-        "co2_pwm_window_s" => 120.0,
-        "co2_pwm_min_on_s" => 20.0,
-        "co2_pwm_min_off_s" => 20.0,
-        "yocto_mA_min" => 4.0,
-        "yocto_mA_max" => 20.0,
-        "yocto_co2_min" => 0.0,
-        "yocto_co2_max" => 1200.0
-    )
+"Legacy process and controller defaults retained for backward-compatible `apply_parameter_defaults!` calls."
+const LEGACY_PROCESS_DEFAULTS = Dict{String,Any}(
+    "VVM" => 0.1,
+    "R_gas" => 0.082057,
+    "T_K" => 310.15,
+    "P_CO2_gas" => 1.0,
+    "Z_succ_avg" => 2.0,
+    "Z_carb_avg" => 1.0,
+    "D_succ_bulk" => 1.049e-9,
+    "D_HCO3_bulk" => 1.588e-9,
+    "D_acet_bulk" => 1.459e-9,
+    "K_Don" => 1.5,
+    "A_mem" => 0.01,
+    "C_acet_bg" => 0.0,
+    "J_max_OH" => 1e-4,
+    "controlLim" => 5.0,
+    "tau_adapt" => 600.0,
+    "gamma_adapt" => 0.0,
+    "deadband" => 0.05,
+    "pH_initial_non_measured" => NaN,
+    "pH_ferm_offset" => 0.0,
+    "pH_extr_offset" => 0.0,
+    "initial_current" => 0.0,
+    "reset_parameters" => false,
+    "soft_reset_parameters" => false,
+    "target_pH" => 7.2,
+    "control_interval" => 1.0,
+    "time_resolution" => 0.1,
+)
 
-    # Apply defaults for any missing keys
-    for (key, default_val) in defaults
-        if !haskey(params, key)
-            params[key] = default_val
+const INTEGER_PARAMETER_KEYS = Set{String}([
+    "co2_numato_baudrate", "co2_adc_channel", "co2_relay_channel",
+    "baud_rate", "yocto_channel", "n_membranes", "max_pred_steps",
+])
+
+const FLOAT_PARAMETER_KEYS = Set{String}([
+    "VVM", "R_gas", "T_K", "P_CO2_gas", "Z_succ_avg", "Z_carb_avg",
+    "D_succ_bulk", "D_HCO3_bulk", "D_acet_bulk", "K_Don", "A_mem", "C_acet_bg",
+    "J_max_OH", "controlLim", "tau_adapt", "gamma_adapt", "deadband",
+    "pH_ferm_offset", "pH_extr_offset",
+    "co2_max_lpm", "co2_min_continuous_lpm", "pump_max_L_h", "pump_min", "pump_baseline", "pump_slew_rate_limit",
+    "manual_current_A", "manual_co2_pct", "manual_pump_pct",
+    "yocto_mA_min", "yocto_mA_max", "yocto_co2_min", "yocto_co2_max",
+    "Kp", "Ki", "Kd", "tau_I", "tau_D", "initial_current",
+    "target_pH", "control_interval", "time_resolution", "rolling_window", "co2_setpoint",
+    "co2_cal_X1", "co2_cal_Y1", "co2_cal_X2", "co2_cal_Y2",
+    "co2_pi_Kp", "co2_pi_Ki", "co2_pwm_window_s", "co2_pwm_min_on_s", "co2_pwm_min_off_s",
+])
+
+function _normalize_parameter_types!(params::Dict, defaults_lookup::AbstractDict)
+    for key in INTEGER_PARAMETER_KEYS
+        if haskey(params, key)
+            val = params[key]
+            if val === nothing || val === "null" || (val isa AbstractFloat && isnan(val))
+                params[key] = get(defaults_lookup, key, 0)
+            elseif val isa AbstractString
+                parsed = tryparse(Int, strip(val))
+                params[key] = parsed === nothing ? round(Int, parse(Float64, strip(val))) : parsed
+            else
+                params[key] = round(Int, val)
+            end
         end
     end
 
-    # Type Conversion to Float64
-    numeric_keys = [
-        "VVM", "R_gas", "T_K", "P_CO2_gas", "Z_succ_avg", "Z_carb_avg",
-        "D_succ_bulk", "D_HCO3_bulk", "D_acet_bulk", "K_Don", "A_mem", "C_acet_bg",
-        "J_max_OH", "controlLim", "tau_adapt", "gamma_adapt", "deadband",
-        "pH_ferm_offset", "pH_extr_offset",
-        "co2_max_lpm", "co2_min_continuous_lpm", "pump_max_L_h", "pump_min", "pump_baseline", "pump_slew_rate_limit",
-        "manual_current_A", "manual_co2_pct", "manual_pump_pct",
-        "yocto_mA_min", "yocto_mA_max", "yocto_co2_min", "yocto_co2_max",
-        "Kp", "Ki", "Kd", "tau_I", "tau_D", "initial_current",
-        "target_pH", "control_interval", "time_resolution", "rolling_window", "co2_setpoint",
-        "co2_numato_baudrate", "co2_adc_channel", "co2_relay_channel",
-        "co2_cal_X1", "co2_cal_Y1", "co2_cal_X2", "co2_cal_Y2",
-        "co2_pi_Kp", "co2_pi_Ki", "co2_pwm_window_s", "co2_pwm_min_on_s", "co2_pwm_min_off_s"
-    ]
-
-    for key in numeric_keys
-        if haskey(params, key) && !isnan(params[key])
-            params[key] = Float64(params[key])
+    for key in FLOAT_PARAMETER_KEYS
+        if haskey(params, key)
+            val = params[key]
+            if val === nothing || val === "null"
+                params[key] = Float64(get(defaults_lookup, key, NaN))
+            elseif val isa AbstractString
+                parsed = tryparse(Float64, strip(val))
+                params[key] = parsed === nothing ? NaN : parsed
+            elseif val isa Real
+                params[key] = Float64(val)
+            end
         end
     end
 
-    # Special handling for NaN in pH_initial_non_measured
     if haskey(params, "pH_initial_non_measured")
         val = params["pH_initial_non_measured"]
         if val === nothing || val === "null"
             params["pH_initial_non_measured"] = NaN
+        elseif val isa AbstractString
+            parsed = tryparse(Float64, strip(val))
+            params["pH_initial_non_measured"] = parsed === nothing ? NaN : parsed
         else
             params["pH_initial_non_measured"] = Float64(val)
         end
     end
+    return params
+end
+
+"""
+    apply_hardware_defaults!(params::Dict; extra_defaults::AbstractDict = Dict{String,Any}())
+
+Populate missing hardware-layer configuration keys (`HARDWARE_PARAMETER_DEFAULTS` plus any `extra_defaults`)
+and enforce `Int` vs `Float64` types without injecting application-specific process/chemistry parameters.
+"""
+function apply_hardware_defaults!(params::Dict; extra_defaults::AbstractDict = Dict{String,Any}())
+    merged_defaults = merge(HARDWARE_PARAMETER_DEFAULTS, extra_defaults)
+    for (key, default_val) in merged_defaults
+        if !haskey(params, key) || params[key] === nothing || params[key] === "null"
+            params[key] = default_val
+        end
+    end
+    return _normalize_parameter_types!(params, merged_defaults)
+end
+
+"""
+    apply_parameter_defaults!(params::Dict; include_legacy_process_defaults::Bool = true, extra_defaults::AbstractDict = Dict{String,Any}())
+
+Fill in missing parameters and enforce numeric types (`Int` for channels/baudrates, `Float64` for continuous values).
+When `include_legacy_process_defaults = false`, only hardware defaults and `extra_defaults` are applied.
+"""
+function apply_parameter_defaults!(
+    params::Dict;
+    include_legacy_process_defaults::Bool = true,
+    extra_defaults::AbstractDict = Dict{String,Any}()
+)
+    base_defaults = include_legacy_process_defaults ?
+        merge(LEGACY_PROCESS_DEFAULTS, HARDWARE_PARAMETER_DEFAULTS, extra_defaults) :
+        merge(HARDWARE_PARAMETER_DEFAULTS, extra_defaults)
+
+    for (key, default_val) in base_defaults
+        if !haskey(params, key)
+            params[key] = default_val
+        end
+    end
+    return _normalize_parameter_types!(params, base_defaults)
 end

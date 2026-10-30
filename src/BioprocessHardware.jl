@@ -6,7 +6,6 @@ using Sockets
 using SQLite
 using DBInterface
 using LibSerialPort
-using JSON
 using JSON3
 
 # Driver core: errors, typed readings, common interface, transports, mocks, logging
@@ -83,6 +82,7 @@ export log_device, write_log_header
 # --- Legacy flat API (kept until each instrument is ported) -------------------
 # Config Manager
 export load_control_parameters, save_params_to_json, apply_parameter_defaults!
+export strip_json_comments, apply_hardware_defaults!, HARDWARE_PARAMETER_DEFAULTS
 
 # Telemetry Logger
 export init_telemetry_db, insert_params_to_db!, flush_telemetry_to_db!, init_csv_file

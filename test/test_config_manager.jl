@@ -68,4 +68,47 @@ using BioprocessHardware
     @test loaded_typed["manual_override_mode"] isa Bool && loaded_typed["manual_override_mode"] == true
     @test loaded_typed["control_interval"] == 1.0
     rm(tmp_typed_path, force=true)
+
+    # CF8: Integer keys remain Int (B2 fix) and null values handled safely
+    int_and_null_params = Dict{String, Any}(
+        "co2_numato_baudrate" => 115200.0,
+        "co2_adc_channel" => "2",
+        "co2_relay_channel" => 1,
+        "VVM" => nothing,
+        "pH_initial_non_measured" => "null"
+    )
+    apply_parameter_defaults!(int_and_null_params)
+    @test int_and_null_params["co2_numato_baudrate"] isa Int
+    @test int_and_null_params["co2_numato_baudrate"] == 115200
+    @test int_and_null_params["co2_adc_channel"] isa Int
+    @test int_and_null_params["co2_adc_channel"] == 2
+    @test int_and_null_params["co2_relay_channel"] isa Int
+    @test int_and_null_params["VVM"] === 0.1
+    @test isnan(int_and_null_params["pH_initial_non_measured"])
+
+    # CF9: URLs inside strings are not corrupted by strip_json_comments (B5 fix)
+    jsonc_with_url = """
+    {
+        // Hub endpoint comment
+        "hub_url": "http://127.0.0.1:4444/bySerial/RX420MA1/api", # inline hash comment
+        "tag": "run#1 // not a comment",
+        "VVM": 0.12,
+    }
+    """
+    stripped = strip_json_comments(jsonc_with_url)
+    url_path = tempname() * ".json"
+    write(url_path, jsonc_with_url)
+    loaded_url = load_control_parameters(url_path)
+    @test loaded_url["hub_url"] == "http://127.0.0.1:4444/bySerial/RX420MA1/api"
+    @test loaded_url["tag"] == "run#1 // not a comment"
+    @test loaded_url["VVM"] == 0.12
+    rm(url_path, force=true)
+
+    # CF10: apply_hardware_defaults! injects only hardware keys, not process chemistry (R1 fix)
+    hw_only = Dict{String, Any}()
+    apply_hardware_defaults!(hw_only)
+    @test haskey(hw_only, "co2_numato_port")
+    @test hw_only["co2_numato_baudrate"] isa Int
+    @test !haskey(hw_only, "D_succ_bulk")
+    @test !haskey(hw_only, "target_pH")
 end

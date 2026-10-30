@@ -6,7 +6,6 @@ authors = ["Gaétan Herold <gaetan.herold@ugent.be>"]
 [deps]
 DBInterface = "a10d1c49-ce27-4219-8d33-6db1a4562965"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
-JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 LibSerialPort = "a05a14c7-6e3b-5ba9-90a2-45558833e1df"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
@@ -22,7 +21,6 @@ BioprocessHardwareUnitfulExt = "Unitful"
 [compat]
 DBInterface = "2"
 Dates = "1"
-JSON = "1"
 JSON3 = "1"
 LibSerialPort = "0.5"
 Printf = "1"
