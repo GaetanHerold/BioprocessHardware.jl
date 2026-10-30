@@ -53,7 +53,10 @@ using .Solress: SOLRESSTelemetry, SolressTelemetry,
                 read_telemetry, is_healthy, reconnect_solress_driver!,
                 solress_crc16, format_solress_packet, parse_solress_packet, detect_solress_ports,
                 start_mock_mcu!, stop_mock_mcu!, step_simulation!, inject_slip_fault!, inject_overpressure_fault!,
-                channel_put_drop_oldest!
+                channel_put_drop_oldest!,
+                CounterpressureValveTelemetry, CounterpressureValveDriver, CounterpressureValveDevice,
+                MockCounterpressureValveMCU, open_counterpressure_valve, close_counterpressure_valve!,
+                valve_crc16, format_valve_packet, parse_valve_packet
 include("instruments/voltcraft_dpps.jl")
 using .VoltcraftDPPS: DPPSReading, DPPSDevice, open_dpps, close_dpps!,
                       read_dpps_telemetry, parse_dpps_telemetry, detect_dpps_ports,
@@ -86,6 +89,7 @@ export strip_json_comments, apply_hardware_defaults!, HARDWARE_PARAMETER_DEFAULT
 
 # Telemetry Logger
 export init_telemetry_db, insert_params_to_db!, flush_telemetry_to_db!, init_csv_file
+export DEFAULT_TELEMETRY_COLUMNS, CSV_TELEMETRY_HEADER
 
 # MCU Serial Stream
 export is_measurement_line, parse_mcu_line, format_mcu_actuator_command, MCUTelemetry
@@ -101,6 +105,9 @@ export read_telemetry, is_healthy, reconnect_solress_driver!
 export solress_crc16, format_solress_packet, parse_solress_packet, detect_solress_ports
 export start_mock_mcu!, stop_mock_mcu!, step_simulation!, inject_slip_fault!, inject_overpressure_fault!
 export channel_put_drop_oldest!
+export CounterpressureValveTelemetry, CounterpressureValveDriver, CounterpressureValveDevice
+export MockCounterpressureValveMCU, open_counterpressure_valve, close_counterpressure_valve!
+export valve_crc16, format_valve_packet, parse_valve_packet
 
 # BioFlo Modbus
 export float32_to_bytes, bytes_to_float32, read_float_register, write_float_register

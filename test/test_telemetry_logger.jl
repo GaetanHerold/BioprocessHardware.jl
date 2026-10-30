@@ -101,4 +101,18 @@ using BioprocessHardware
     rm(tmp_csv, force=true)
     @test !isfile(tmp_db_path)
     @test !isfile(tmp_csv)
+
+    # TL10: Custom generic schema and corrupt DB auto-recovery (B7 & R2 fix)
+    corrupt_path = tempname() * ".sqlite"
+    write(corrupt_path, "NOT A VALID SQLITE FILE HEADER!!")
+    custom_cols = ["pH" => "REAL", "temp_C" => "REAL", "valve_pct" => "REAL"]
+    (db_custom, stmt_custom) = init_telemetry_db(corrupt_path, "generic_bioreactor_1", true; columns = custom_cols)
+    custom_buf = [("2026-10-30 12:00:00.000", "generic_bioreactor_1", 6.8, 37.0, 45.0)]
+    flush_telemetry_to_db!(db_custom, stmt_custom, custom_buf)
+    @test isempty(custom_buf)
+    close(db_custom)
+    rm(corrupt_path, force=true)
+    for f in filter(x -> startswith(x, basename(corrupt_path)), readdir(dirname(corrupt_path); join=true))
+        rm(f, force=true)
+    end
 end

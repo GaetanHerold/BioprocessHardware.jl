@@ -1039,4 +1039,19 @@ function reconnect_solress_driver!(driver::SolressSerialDriver; max_retries::Int
     return false
 end
 
+# Domain-neutral aliases for generic counterpressure needle-valve MCU applications
+const CounterpressureValveTelemetry = SolressTelemetry
+const CounterpressureValveDriver = SolressSerialDriver
+const CounterpressureValveDevice = SolressDevice
+const MockCounterpressureValveMCU = MockSolressMCU
+const open_counterpressure_valve = open_solress
+const close_counterpressure_valve! = close_solress!
+const valve_crc16 = solress_crc16
+const format_valve_packet = format_solress_packet
+const parse_valve_packet = parse_solress_packet
+
+export CounterpressureValveTelemetry, CounterpressureValveDriver, CounterpressureValveDevice,
+       MockCounterpressureValveMCU, open_counterpressure_valve, close_counterpressure_valve!,
+       valve_crc16, format_valve_packet, parse_valve_packet
+
 end # module Solress
