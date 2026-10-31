@@ -47,23 +47,28 @@ cmd = format_mcu_actuator_command(3.5, 50.0, 60.0)
 println("Formatted Command: ", repr(cmd))
 ```
 
-### 2. High-throughput SQLite WAL logging
+### 2. High-throughput SQLite WAL logging & Configurable Schemas
 
 ```julia
 using BioprocessHardware
 using SQLite
 
-# Initialize experiment telemetry database
+# Initialize experiment telemetry database with default or custom schema
 db_path = "experiments/Lab_Experiments.sqlite"
 exp_id = "test_hardware_run"
-(db, log_stmt) = init_telemetry_db(db_path, exp_id, false)
+(db, log_stmt) = init_telemetry_db(db_path, exp_id, false; columns = DEFAULT_TELEMETRY_COLUMNS)
 
 # Store active control parameters
 insert_params_to_db!(db, exp_id, Dict("target_pH" => 6.2, "Kp" => 0.1), "initial")
 println("Telemetry database initialized with WAL journaling.")
 ```
 
-### 3. Standalone benchtop logging and quickstart
+### 3. Decoupled Parameter Management & Generic Actuator Aliases
+- `apply_hardware_defaults!(params; extra_defaults)`: Injects pure hardware defaults while allowing downstream applications to supply domain-specific process defaults. Preserves integer typing (`Int`) for hardware ports/channels and floats for control gains.
+- `save_params_to_json(params, path)`: Atomic parameter serialization with temporary file staging and sync-to-disk guarantees.
+- `CounterpressureValveDriver` / `MockCounterpressureValveMCU`: Domain-neutral aliases for motorized needle valves and backpressure regulation MCUs.
+
+### 4. Standalone benchtop logging and quickstart
 For standalone lab instrument logging on any laptop:
 - Run standalone examples in `examples/` (e.g. `julia --project=. examples/log_power_supply.jl`).
 - Consult the [Laboratory Hardware Quickstart Guide](docs/HARDWARE_QUICKSTART.md) for 2-minute setup, Linux `dialout` instructions, and zero-bloat standalone usage.
